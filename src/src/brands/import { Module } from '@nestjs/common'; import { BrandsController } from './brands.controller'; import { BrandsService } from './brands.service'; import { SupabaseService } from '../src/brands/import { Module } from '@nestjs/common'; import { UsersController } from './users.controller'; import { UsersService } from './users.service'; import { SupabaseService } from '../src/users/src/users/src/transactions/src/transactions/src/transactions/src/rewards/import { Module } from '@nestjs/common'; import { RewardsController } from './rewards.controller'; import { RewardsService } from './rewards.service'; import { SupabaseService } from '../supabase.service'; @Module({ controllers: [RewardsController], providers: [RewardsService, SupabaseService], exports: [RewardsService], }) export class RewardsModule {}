@@ -1,0 +1,79 @@
+import { Injectable } from '@nestjs/common';
+import { SupabaseService } from '../supabase.service';
+@Injectable()
+export class RewardsService {
+constructor(private supabase: SupabaseService) {}
+async createPool(dto: any) {
+const { data, error } = await this.supabase.getClient()
+.from('reward_pools')
+.insert(dto)
+.select()
+.single();
+if (error) throw error;
+return data;
+}
+async getActivePools() {
+const { data, error } = await this.supabase.getClient()
+.from('reward_pools')
+.select('*, brands(name)')
+.eq('active', true)
+.order('distributed_at', { ascending: false });
+if (error) throw error;
+return data;
+}
+async getPoolById(id: string) {
+const { data, error } = await this.supabase.getClient()
+.from('reward_pools')
+.select('*, brands(name)')
+.eq('id', id)
+.single();
+if (error) throw error;
+return data;
+}
+async allocateReward(poolId: string, userId: string, amount: number) {
+const { data, error } = await this.supabase.getClient()
+.from('reward_claims')
+.insert({ pool_id: poolId, user_id: userId, amount })
+.select()
+.single();
+if (error) throw error;
+return data;
+}
+async claimReward(poolId: string, userId: string) {
+const { data: claim, error: claimError } = await this.supabase.getClient()
+.from('reward_claims')
+.select('*')
+.eq('pool_id', poolId)
+.eq('user_id', userId)
+.single();
+if (claimError) throw claimError;
+if (claim.claimed) throw new Error('Already claimed');
+const { data, error } = await this.supabase.getClient()
+.from('reward_claims')
+.update({ claimed: true, claimed_at: new Date().toISOString() })
+.eq('pool_id', poolId)
+.eq('user_id', userId)
+.select()
+.single();
+if (error) throw error;
+return data;
+}
+async getUserClaims(userId: string) {
+const { data, error } = await this.supabase.getClient()
+.from('reward_claims')
+.select(', reward_pools(, brands(name))')
+.eq('user_id', userId)
+.order('claimed', { ascending: true });
+if (error) throw error;
+return data;
+}
+async getBrandPools(brandId: string) {
+const { data, error } = await this.supabase.getClient()
+.from('reward_pools')
+.select('*')
+.eq('brand_id', brandId)
+.order('distributed_at', { ascending: false });
+if (error) throw error;
+return data;
+}
+}
