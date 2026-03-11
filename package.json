@@ -1,0 +1,33 @@
+{
+"name": "luxfi-backend",
+"version": "1.0.0",
+"scripts": {
+"start": "node dist/main.js",
+"build": "nest build",
+"dev": "nest start --watch"
+},
+"dependencies": {
+"@nestjs/common": "^10.0.0",
+"@nestjs/core": "^10.0.0",
+"@nestjs/platform-express": "^10.0.0",
+"@nestjs/config": "^3.0.0",
+"@nestjs/jwt": "^10.0.0",
+"@supabase/supabase-js": "^2.0.0",
+"ioredis": "^5.0.0",
+"bullmq": "^5.0.0",
+"ethers": "^6.0.0",
+"merkletreejs": "^0.3.0",
+"keccak256": "^1.0.0",
+"express": "^4.18.0",
+"cors": "^2.8.5",
+"helmet": "^7.0.0",
+"express-rate-limit": "^7.0.0",
+"reflect-metadata": "^0.1.13",
+"rxjs": "^7.8.0"
+},
+"devDependencies": {
+"@nestjs/cli": "^10.0.0",
+"@nestjs/testing": "^10.0.0",
+"typescript": "^5.0.0"
+}
+}
