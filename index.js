@@ -3,9 +3,11 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const redis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN });
 
 app.use(helmet());
 app.use(cors({ origin: ['https://luxfivault.netlify.app', 'http://localhost:5173'], credentials: true }));
@@ -15,15 +17,33 @@ app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 app.get('/api/health', (req, res) => res.json({ status: 'LUXFI Backend Online', time: new Date() }));
 
 app.get('/api/brands', async (req, res) => {
-  const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  try {
+    const cached = await redis.get('brands:all');
+    if (cached) return res.json(cached);
+    const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    await redis.set('brands:all', data, { ex: 60 });
+    res.json(data);
+  } catch (e) {
+    const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+  }
 });
 
 app.get('/api/brands/active', async (req, res) => {
-  const { data, error } = await supabase.from('brands').select('*').eq('status', 'active');
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  try {
+    const cached = await redis.get('brands:active');
+    if (cached) return res.json(cached);
+    const { data, error } = await supabase.from('brands').select('*').eq('status', 'active');
+    if (error) return res.status(500).json({ error: error.message });
+    await redis.set('brands:active', data, { ex: 60 });
+    res.json(data);
+  } catch (e) {
+    const { data, error } = await supabase.from('brands').select('*').eq('status', 'active');
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+  }
 });
 
 app.get('/api/brands/:id', async (req, res) => {
@@ -35,12 +55,16 @@ app.get('/api/brands/:id', async (req, res) => {
 app.post('/api/brands', async (req, res) => {
   const { data, error } = await supabase.from('brands').insert(req.body).select().single();
   if (error) return res.status(500).json({ error: error.message });
+  await redis.del('brands:all');
+  await redis.del('brands:active');
   res.json(data);
 });
 
 app.put('/api/brands/:id', async (req, res) => {
   const { data, error } = await supabase.from('brands').update(req.body).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
+  await redis.del('brands:all');
+  await redis.del('brands:active');
   res.json(data);
 });
 
