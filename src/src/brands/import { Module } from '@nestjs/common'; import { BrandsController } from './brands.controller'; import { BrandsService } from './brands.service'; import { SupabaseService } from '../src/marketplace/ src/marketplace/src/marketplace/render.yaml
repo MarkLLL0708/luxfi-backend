@@ -1,4 +1,6 @@
-web
+services:
+
+type: web
 name: luxfi-backend
 runtime: node
 buildCommand: npm install && npm run build
