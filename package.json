@@ -3,7 +3,7 @@
 "version": "1.0.0",
 "scripts": {
 "start": "node dist/main.js",
-"build": "nest build",
+"build": "npx nest build",
 "dev": "nest start --watch"
 },
 "dependencies": {
@@ -12,6 +12,11 @@
 "@nestjs/platform-express": "^10.0.0",
 "@nestjs/config": "^3.0.0",
 "@nestjs/jwt": "^10.0.0",
+"@nestjs/cli": "^10.0.0",
+"@nestjs/schematics": "^10.0.0",
+"@nestjs/testing": "^10.0.0",
+"typescript": "^5.0.0",
+"ts-node": "^10.0.0",
 "@supabase/supabase-js": "^2.0.0",
 "ioredis": "^5.0.0",
 "bullmq": "^5.0.0",
@@ -24,10 +29,5 @@
 "express-rate-limit": "^7.0.0",
 "reflect-metadata": "^0.1.13",
 "rxjs": "^7.8.0"
-},
-"devDependencies": {
-"@nestjs/cli": "^10.0.0",
-"@nestjs/testing": "^10.0.0",
-"typescript": "^5.0.0"
 }
 }
