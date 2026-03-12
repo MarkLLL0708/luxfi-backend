@@ -14,6 +14,14 @@ app.use(cors({ origin: ['https://luxfivault.netlify.app', 'http://localhost:5173
 app.use(express.json());
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 
+const requireAdminKey = (req, res, next) => {
+  const key = req.headers['x-admin-key'];
+  if (key !== process.env.LUXFI_ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+};
+
 app.get('/api/health', (req, res) => res.json({ status: 'LUXFI Backend Online', time: new Date() }));
 
 app.get('/api/brands', async (req, res) => {
@@ -52,7 +60,7 @@ app.get('/api/brands/:id', async (req, res) => {
   res.json(data);
 });
 
-app.post('/api/brands', async (req, res) => {
+app.post('/api/brands', requireAdminKey, async (req, res) => {
   const { data, error } = await supabase.from('brands').insert(req.body).select().single();
   if (error) return res.status(500).json({ error: error.message });
   await redis.del('brands:all');
@@ -60,7 +68,7 @@ app.post('/api/brands', async (req, res) => {
   res.json(data);
 });
 
-app.put('/api/brands/:id', async (req, res) => {
+app.put('/api/brands/:id', requireAdminKey, async (req, res) => {
   const { data, error } = await supabase.from('brands').update(req.body).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   await redis.del('brands:all');
@@ -76,6 +84,7 @@ app.get('/api/users/:wallet', async (req, res) => {
 
 app.post('/api/users/connect', async (req, res) => {
   const { walletAddress, email } = req.body;
+  if (!walletAddress) return res.status(400).json({ error: 'Wallet address required' });
   const { data: existing } = await supabase.from('users').select('*').eq('wallet_address', walletAddress).single();
   if (existing) return res.json(existing);
   const { data, error } = await supabase.from('users').insert({ wallet_address: walletAddress, email }).select().single();
@@ -83,7 +92,7 @@ app.post('/api/users/connect', async (req, res) => {
   res.json(data);
 });
 
-app.put('/api/users/:id/kyc', async (req, res) => {
+app.put('/api/users/:id/kyc', requireAdminKey, async (req, res) => {
   const { data, error } = await supabase.from('users').update({ kyc_status: req.body.status, kyc_provider_id: req.body.providerId }).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -109,7 +118,7 @@ app.get('/api/transactions/brand/:brandId', async (req, res) => {
   res.json(data);
 });
 
-app.post('/api/transactions', async (req, res) => {
+app.post('/api/transactions', requireAdminKey, async (req, res) => {
   const { data, error } = await supabase.from('transactions').insert(req.body).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -121,7 +130,7 @@ app.get('/api/rewards/pools', async (req, res) => {
   res.json(data);
 });
 
-app.post('/api/rewards/pools', async (req, res) => {
+app.post('/api/rewards/pools', requireAdminKey, async (req, res) => {
   const { data, error } = await supabase.from('reward_pools').insert(req.body).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -135,6 +144,7 @@ app.get('/api/rewards/user/:userId', async (req, res) => {
 
 app.post('/api/rewards/claim', async (req, res) => {
   const { poolId, userId } = req.body;
+  if (!poolId || !userId) return res.status(400).json({ error: 'poolId and userId required' });
   const { data, error } = await supabase.from('reward_claims').update({ claimed: true, claimed_at: new Date().toISOString() }).eq('pool_id', poolId).eq('user_id', userId).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -160,6 +170,7 @@ app.post('/api/governance', async (req, res) => {
 
 app.post('/api/governance/vote', async (req, res) => {
   const { proposalId, userId, support, weight } = req.body;
+  if (!proposalId || !userId) return res.status(400).json({ error: 'proposalId and userId required' });
   const { data, error } = await supabase.from('votes').insert({ proposal_id: proposalId, user_id: userId, support, weight }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
