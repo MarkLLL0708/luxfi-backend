@@ -7,7 +7,7 @@ const { Redis } = require('@upstash/redis');
 
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const redis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN });
+const redis = new Redis({ url: (process.env.UPSTASH_REDIS_REST_URL || '').replace(/"/g, ''), token: (process.env.UPSTASH_REDIS_REST_TOKEN || '').replace(/"/g, '') });
 
 app.use(helmet());
 app.use(cors({ origin: ['https://luxfivault.netlify.app', 'http://localhost:5173'], credentials: true }));
