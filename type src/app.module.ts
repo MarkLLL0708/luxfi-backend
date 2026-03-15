@@ -6,16 +6,18 @@ import { TransactionsModule } from './transactions/transactions.module';
 import { RewardsModule } from './rewards/rewards.module';
 import { GovernanceModule } from './governance/governance.module';
 import { MarketplaceModule } from './marketplace/marketplace.module';
+import { MissionsModule } from './missions/missions.module';
+
 @Module({
-imports: [
-ConfigModule.forRoot({ isGlobal: true }),
-BrandsModule,
-UsersModule,
-TransactionsModule,
-RewardsModule,
-GovernanceModule,
-MarketplaceModule,
-],
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    BrandsModule,
+    UsersModule,
+    TransactionsModule,
+    RewardsModule,
+    GovernanceModule,
+    MarketplaceModule,
+    MissionsModule,
+  ],
 })
 export class AppModule {}
-
