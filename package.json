@@ -12,6 +12,10 @@
     "helmet": "^7.0.0",
     "express-rate-limit": "^7.0.0",
     "ethers": "^6.0.0",
-    "jsonwebtoken": "^9.0.0"
+    "jsonwebtoken": "^9.0.0",
+    "express-mongo-sanitize": "^2.2.0",
+    "xss": "^1.0.14",
+    "winston": "^3.11.0",
+    "express-validator": "^7.0.1"
   }
 }
