@@ -24,49 +24,34 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const JWT_SECRET = process.env.JWT_SECRET;
 
 // ─── SECURITY MIDDLEWARE ──────────────────────────────────
-app.use(helmet({
-  contentSecurityPolicy: true,
-  crossOriginEmbedderPolicy: true,
-}));
+app.use(helmet({ contentSecurityPolicy: true, crossOriginEmbedderPolicy: true }));
 
-// Production-only CORS
 const allowedOrigins = process.env.NODE_ENV === 'production'
   ? ['https://luxfivault.netlify.app']
   : ['https://luxfivault.netlify.app', 'http://localhost:5173'];
 
 app.use(cors({ origin: allowedOrigins, credentials: true }));
-
-// Body size limit — prevent DDoS via large payloads
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
-
-// Sanitize inputs — prevent NoSQL injection
 app.use(mongoSanitize());
-
-// Global rate limit
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { error: 'Too many requests' } }));
 
-// Stricter rate limit for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many login attempts' }
 });
 
-// ─── INPUT SANITIZER ─────────────────────────────────────
+// ─── HELPERS ─────────────────────────────────────────────
 const sanitize = (obj) => {
   if (typeof obj === 'string') return xss(obj.trim());
   if (typeof obj === 'object' && obj !== null) {
-    return Object.fromEntries(
-      Object.entries(obj).map(([k, v]) => [k, sanitize(v)])
-    );
+    return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, sanitize(v)]));
   }
   return obj;
 };
 
-// ─── SAFE ERROR RESPONSE ─────────────────────────────────
 const safeError = (res, status, message) => {
-  // Never expose internal error details
   logger.error({ status, message });
   return res.status(status).json({ error: message });
 };
@@ -91,18 +76,23 @@ const authenticateToken = (req, res, next) => {
   }
 };
 
-// ─── HEALTH (public) ─────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ status: 'LUXFI Backend Online', time: new Date() }));
+// ─── API VERSIONING ───────────────────────────────────────
+const v1 = express.Router();
+app.use('/api/v1', v1);
+app.use('/api', v1); // backward compatibility
+
+// ─── HEALTH ───────────────────────────────────────────────
+app.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
+v1.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
 
 // ─── AUTH ─────────────────────────────────────────────────
-app.post('/api/auth/login', authLimiter, async (req, res) => {
+v1.post('/auth/login', authLimiter, async (req, res) => {
   const { walletAddress, signature, message } = sanitize(req.body);
 
   if (!signature || !message || !walletAddress) {
     return safeError(res, 400, 'walletAddress, signature and message required');
   }
 
-  // Validate wallet address format
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
     return safeError(res, 400, 'Invalid wallet address format');
   }
@@ -138,8 +128,8 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-// ─── BRANDS (public read) ─────────────────────────────────
-app.get('/api/brands', async (req, res) => {
+// ─── BRANDS ───────────────────────────────────────────────
+v1.get('/brands', async (req, res) => {
   try {
     const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
     if (error) return safeError(res, 500, 'Failed to fetch brands');
@@ -147,7 +137,7 @@ app.get('/api/brands', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.get('/api/brands/active', async (req, res) => {
+v1.get('/brands/active', async (req, res) => {
   try {
     const { data, error } = await supabase.from('brands').select('*').eq('status', 'active');
     if (error) return safeError(res, 500, 'Failed to fetch brands');
@@ -155,7 +145,7 @@ app.get('/api/brands/active', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.get('/api/brands/:id', async (req, res) => {
+v1.get('/brands/:id', async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const { data, error } = await supabase.from('brands').select('*').eq('id', id).single();
@@ -164,16 +154,17 @@ app.get('/api/brands/:id', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/brands', authenticateToken, async (req, res) => {
+v1.post('/brands', authenticateToken, async (req, res) => {
   try {
     const body = sanitize(req.body);
+    if (!body.name) return safeError(res, 400, 'name required');
     const { data, error } = await supabase.from('brands').insert(body).select().single();
     if (error) return safeError(res, 500, 'Failed to create brand');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.put('/api/brands/:id', authenticateToken, async (req, res) => {
+v1.put('/brands/:id', authenticateToken, async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const body = sanitize(req.body);
@@ -183,8 +174,8 @@ app.put('/api/brands/:id', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── USERS (protected) ───────────────────────────────────
-app.get('/api/users/:wallet', authenticateToken, async (req, res) => {
+// ─── USERS ────────────────────────────────────────────────
+v1.get('/users/:wallet', authenticateToken, async (req, res) => {
   try {
     const wallet = sanitize(req.params.wallet);
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
@@ -194,7 +185,7 @@ app.get('/api/users/:wallet', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.put('/api/users/:id/kyc', authenticateToken, async (req, res) => {
+v1.put('/users/:id/kyc', authenticateToken, async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const { status } = sanitize(req.body);
@@ -206,8 +197,8 @@ app.put('/api/users/:id/kyc', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── TRANSACTIONS (protected) ────────────────────────────
-app.get('/api/transactions', authenticateToken, async (req, res) => {
+// ─── TRANSACTIONS ─────────────────────────────────────────
+v1.get('/transactions', authenticateToken, async (req, res) => {
   try {
     const { data, error } = await supabase.from('transactions').select('*').order('created_at', { ascending: false }).limit(100);
     if (error) return safeError(res, 500, 'Failed to fetch transactions');
@@ -215,7 +206,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.get('/api/transactions/brand/:brandId', authenticateToken, async (req, res) => {
+v1.get('/transactions/brand/:brandId', authenticateToken, async (req, res) => {
   try {
     const brandId = sanitize(req.params.brandId);
     const { data, error } = await supabase.from('transactions').select('*').eq('brand_id', brandId).order('created_at', { ascending: false });
@@ -224,17 +215,18 @@ app.get('/api/transactions/brand/:brandId', authenticateToken, async (req, res) 
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/transactions', authenticateToken, async (req, res) => {
+v1.post('/transactions', authenticateToken, async (req, res) => {
   try {
     const body = sanitize(req.body);
+    if (!body.brand_id || !body.amount) return safeError(res, 400, 'brand_id and amount required');
     const { data, error } = await supabase.from('transactions').insert(body).select().single();
     if (error) return safeError(res, 500, 'Failed to create transaction');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── REWARDS ─────────────────────────────────────────────
-app.get('/api/rewards/pools', async (req, res) => {
+// ─── REWARDS ──────────────────────────────────────────────
+v1.get('/rewards/pools', async (req, res) => {
   try {
     const { data, error } = await supabase.from('reward_pools').select('*, brands(name)').eq('status', 'active');
     if (error) return safeError(res, 500, 'Failed to fetch reward pools');
@@ -242,7 +234,7 @@ app.get('/api/rewards/pools', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.get('/api/rewards/user/:userId', authenticateToken, async (req, res) => {
+v1.get('/rewards/user/:userId', authenticateToken, async (req, res) => {
   try {
     const userId = sanitize(req.params.userId);
     const { data, error } = await supabase.from('reward_claims').select('*, reward_pools(*, brands(name))').eq('user_id', userId);
@@ -251,7 +243,7 @@ app.get('/api/rewards/user/:userId', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/rewards/claim', authenticateToken, async (req, res) => {
+v1.post('/rewards/claim', authenticateToken, async (req, res) => {
   try {
     const { poolId, userId } = sanitize(req.body);
     if (!poolId || !userId) return safeError(res, 400, 'poolId and userId required');
@@ -262,7 +254,7 @@ app.post('/api/rewards/claim', authenticateToken, async (req, res) => {
 });
 
 // ─── GOVERNANCE ───────────────────────────────────────────
-app.get('/api/governance', async (req, res) => {
+v1.get('/governance', async (req, res) => {
   try {
     const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').order('created_at', { ascending: false });
     if (error) return safeError(res, 500, 'Failed to fetch proposals');
@@ -270,7 +262,7 @@ app.get('/api/governance', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.get('/api/governance/active', async (req, res) => {
+v1.get('/governance/active', async (req, res) => {
   try {
     const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').eq('status', 'active').gt('deadline', new Date().toISOString());
     if (error) return safeError(res, 500, 'Failed to fetch proposals');
@@ -278,7 +270,7 @@ app.get('/api/governance/active', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/governance', authenticateToken, async (req, res) => {
+v1.post('/governance', authenticateToken, async (req, res) => {
   try {
     const body = sanitize(req.body);
     if (!body.title || !body.brand_id) return safeError(res, 400, 'title and brand_id required');
@@ -288,7 +280,7 @@ app.post('/api/governance', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/governance/vote', authenticateToken, async (req, res) => {
+v1.post('/governance/vote', authenticateToken, async (req, res) => {
   try {
     const { proposalId, userId, option, votingPower } = sanitize(req.body);
     if (!proposalId || !userId || !option) return safeError(res, 400, 'proposalId, userId and option required');
@@ -301,7 +293,7 @@ app.post('/api/governance/vote', authenticateToken, async (req, res) => {
 });
 
 // ─── MARKETPLACE ──────────────────────────────────────────
-app.get('/api/marketplace', async (req, res) => {
+v1.get('/marketplace', async (req, res) => {
   try {
     const { data, error } = await supabase.from('marketplace_listings').select('*, brands(name)').eq('status', 'active');
     if (error) return safeError(res, 500, 'Failed to fetch listings');
@@ -309,7 +301,7 @@ app.get('/api/marketplace', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/marketplace', authenticateToken, async (req, res) => {
+v1.post('/marketplace', authenticateToken, async (req, res) => {
   try {
     const body = sanitize(req.body);
     if (!body.brand_id || !body.price_bnb) return safeError(res, 400, 'brand_id and price_bnb required');
@@ -320,7 +312,7 @@ app.post('/api/marketplace', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.put('/api/marketplace/:id/purchase', authenticateToken, async (req, res) => {
+v1.put('/marketplace/:id/purchase', authenticateToken, async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const { buyerWallet, txHash } = sanitize(req.body);
@@ -333,7 +325,7 @@ app.put('/api/marketplace/:id/purchase', authenticateToken, async (req, res) => 
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.put('/api/marketplace/:id/cancel', authenticateToken, async (req, res) => {
+v1.put('/marketplace/:id/cancel', authenticateToken, async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const { data, error } = await supabase.from('marketplace_listings').update({ status: 'cancelled' }).eq('id', id).select().single();
@@ -342,8 +334,8 @@ app.put('/api/marketplace/:id/cancel', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── MISSIONS (public read) ───────────────────────────────
-app.get('/api/missions', async (req, res) => {
+// ─── MISSIONS ─────────────────────────────────────────────
+v1.get('/missions', async (req, res) => {
   try {
     const { city, mission_type, difficulty } = sanitize(req.query);
     let query = supabase.from('missions').select('*').eq('status', 'active').gt('deadline', new Date().toISOString()).order('created_at', { ascending: false });
@@ -356,7 +348,7 @@ app.get('/api/missions', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.get('/api/missions/leaderboard', async (req, res) => {
+v1.get('/missions/leaderboard', async (req, res) => {
   try {
     const { data, error } = await supabase.from('leaderboard_weekly').select('*').limit(20);
     if (error) return safeError(res, 500, 'Failed to fetch leaderboard');
@@ -364,7 +356,7 @@ app.get('/api/missions/leaderboard', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.get('/api/missions/:id', async (req, res) => {
+v1.get('/missions/:id', async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const { data, error } = await supabase.from('missions').select('*').eq('id', id).single();
@@ -373,7 +365,7 @@ app.get('/api/missions/:id', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/missions', authenticateToken, async (req, res) => {
+v1.post('/missions', authenticateToken, async (req, res) => {
   try {
     const body = sanitize(req.body);
     if (!body.codename || !body.brand_name || !body.city) return safeError(res, 400, 'codename, brand_name and city required');
@@ -383,7 +375,7 @@ app.post('/api/missions', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/missions/:id/claim', authenticateToken, async (req, res) => {
+v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const { walletAddress, stakeTxHash } = sanitize(req.body);
@@ -398,7 +390,7 @@ app.post('/api/missions/:id/claim', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/missions/claims/:claimId/submit', authenticateToken, async (req, res) => {
+v1.post('/missions/claims/:claimId/submit', authenticateToken, async (req, res) => {
   try {
     const claimId = sanitize(req.params.claimId);
     const { intel_text, intel_photos, intel_video_url, gps_lat, gps_lng } = sanitize(req.body);
@@ -409,7 +401,7 @@ app.post('/api/missions/claims/:claimId/submit', authenticateToken, async (req, 
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.post('/api/missions/claims/:claimId/approve', async (req, res) => {
+v1.post('/missions/claims/:claimId/approve', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
@@ -420,7 +412,7 @@ app.post('/api/missions/claims/:claimId/approve', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-app.get('/api/missions/agent/:wallet', authenticateToken, async (req, res) => {
+v1.get('/missions/agent/:wallet', authenticateToken, async (req, res) => {
   try {
     const wallet = sanitize(req.params.wallet);
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
@@ -433,9 +425,7 @@ app.get('/api/missions/agent/:wallet', authenticateToken, async (req, res) => {
 });
 
 // ─── 404 HANDLER ─────────────────────────────────────────
-app.use((req, res) => {
-  safeError(res, 404, 'Route not found');
-});
+app.use((req, res) => safeError(res, 404, 'Route not found'));
 
 // ─── GLOBAL ERROR HANDLER ────────────────────────────────
 app.use((err, req, res, next) => {
@@ -445,4 +435,4 @@ app.use((err, req, res, next) => {
 
 // ─── START ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => logger.info({ message: `LUXFI Backend running on port ${PORT}` }));
+app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
