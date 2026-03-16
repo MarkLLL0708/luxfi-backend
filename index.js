@@ -3,55 +3,30 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
-const { Redis } = require('@upstash/redis');
+const { ethers } = require('ethers');
 
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const redis = new Redis({ url: (process.env.UPSTASH_REDIS_REST_URL || '').replace(/"/g, ''), token: (process.env.UPSTASH_REDIS_REST_TOKEN || '').replace(/"/g, '') });
 
 app.use(helmet());
 app.use(cors({ origin: ['https://luxfivault.netlify.app', 'http://localhost:5173'], credentials: true }));
 app.use(express.json());
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 
-const requireAdminKey = (req, res, next) => {
-  const key = req.headers['x-admin-key'];
-  if (key !== process.env.LUXFI_ADMIN_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-};
-
+// ─── HEALTH ──────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ status: 'LUXFI Backend Online', time: new Date() }));
 
+// ─── BRANDS ──────────────────────────────────────────────
 app.get('/api/brands', async (req, res) => {
-  try {
-    const cached = await redis.get('brands:all');
-    if (cached) return res.json(cached);
-    const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
-    await redis.set('brands:all', data, { ex: 60 });
-    res.json(data);
-  } catch (e) {
-    const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
-  }
+  const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 app.get('/api/brands/active', async (req, res) => {
-  try {
-    const cached = await redis.get('brands:active');
-    if (cached) return res.json(cached);
-    const { data, error } = await supabase.from('brands').select('*').eq('status', 'active');
-    if (error) return res.status(500).json({ error: error.message });
-    await redis.set('brands:active', data, { ex: 60 });
-    res.json(data);
-  } catch (e) {
-    const { data, error } = await supabase.from('brands').select('*').eq('status', 'active');
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
-  }
+  const { data, error } = await supabase.from('brands').select('*').eq('status', 'active');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 app.get('/api/brands/:id', async (req, res) => {
@@ -60,22 +35,19 @@ app.get('/api/brands/:id', async (req, res) => {
   res.json(data);
 });
 
-app.post('/api/brands', requireAdminKey, async (req, res) => {
+app.post('/api/brands', async (req, res) => {
   const { data, error } = await supabase.from('brands').insert(req.body).select().single();
   if (error) return res.status(500).json({ error: error.message });
-  await redis.del('brands:all');
-  await redis.del('brands:active');
   res.json(data);
 });
 
-app.put('/api/brands/:id', requireAdminKey, async (req, res) => {
+app.put('/api/brands/:id', async (req, res) => {
   const { data, error } = await supabase.from('brands').update(req.body).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
-  await redis.del('brands:all');
-  await redis.del('brands:active');
   res.json(data);
 });
 
+// ─── USERS ───────────────────────────────────────────────
 app.get('/api/users/:wallet', async (req, res) => {
   const { data, error } = await supabase.from('users').select('*').eq('wallet_address', req.params.wallet).single();
   if (error) return res.status(404).json({ error: 'User not found' });
@@ -83,23 +55,38 @@ app.get('/api/users/:wallet', async (req, res) => {
 });
 
 app.post('/api/users/connect', async (req, res) => {
-  const { walletAddress, email } = req.body;
-  if (!walletAddress) return res.status(400).json({ error: 'Wallet address required' });
+  const { walletAddress, email, signature, message } = req.body;
+
+  if (!signature || !message) {
+    return res.status(400).json({ error: 'Signature and message required' });
+  }
+
+  try {
+    const recovered = ethers.verifyMessage(message, signature);
+    if (recovered.toLowerCase() !== walletAddress.toLowerCase()) {
+      return res.status(401).json({ error: 'Invalid wallet signature' });
+    }
+  } catch (err) {
+    return res.status(401).json({ error: 'Signature verification failed' });
+  }
+
   const { data: existing } = await supabase.from('users').select('*').eq('wallet_address', walletAddress).single();
   if (existing) return res.json(existing);
+
   const { data, error } = await supabase.from('users').insert({ wallet_address: walletAddress, email }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.put('/api/users/:id/kyc', requireAdminKey, async (req, res) => {
+app.put('/api/users/:id/kyc', async (req, res) => {
   const { data, error } = await supabase.from('users').update({ kyc_status: req.body.status, kyc_provider_id: req.body.providerId }).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
+// ─── TRANSACTIONS ─────────────────────────────────────────
 app.get('/api/transactions', async (req, res) => {
-  const { data, error } = await supabase.from('transactions').select('*').order('recorded_at', { ascending: false }).limit(100);
+  const { data, error } = await supabase.from('transactions').select('*').order('created_at', { ascending: false }).limit(100);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -107,30 +94,31 @@ app.get('/api/transactions', async (req, res) => {
 app.get('/api/transactions/today', async (req, res) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  const { data, error } = await supabase.from('transactions').select('*').gte('recorded_at', today.toISOString());
+  const { data, error } = await supabase.from('transactions').select('*').gte('created_at', today.toISOString());
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
 app.get('/api/transactions/brand/:brandId', async (req, res) => {
-  const { data, error } = await supabase.from('transactions').select('*').eq('brand_id', req.params.brandId).order('recorded_at', { ascending: false });
+  const { data, error } = await supabase.from('transactions').select('*').eq('brand_id', req.params.brandId).order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.post('/api/transactions', requireAdminKey, async (req, res) => {
+app.post('/api/transactions', async (req, res) => {
   const { data, error } = await supabase.from('transactions').insert(req.body).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
+// ─── REWARDS ─────────────────────────────────────────────
 app.get('/api/rewards/pools', async (req, res) => {
-  const { data, error } = await supabase.from('reward_pools').select('*, brands(name)').eq('active', true);
+  const { data, error } = await supabase.from('reward_pools').select('*, brands(name)').eq('status', 'active');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.post('/api/rewards/pools', requireAdminKey, async (req, res) => {
+app.post('/api/rewards/pools', async (req, res) => {
   const { data, error } = await supabase.from('reward_pools').insert(req.body).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -144,20 +132,20 @@ app.get('/api/rewards/user/:userId', async (req, res) => {
 
 app.post('/api/rewards/claim', async (req, res) => {
   const { poolId, userId } = req.body;
-  if (!poolId || !userId) return res.status(400).json({ error: 'poolId and userId required' });
-  const { data, error } = await supabase.from('reward_claims').update({ claimed: true, claimed_at: new Date().toISOString() }).eq('pool_id', poolId).eq('user_id', userId).select().single();
+  const { data, error } = await supabase.from('reward_claims').update({ status: 'claimed', claimed_at: new Date().toISOString() }).eq('reward_pool_id', poolId).eq('user_id', userId).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
+// ─── GOVERNANCE ───────────────────────────────────────────
 app.get('/api/governance', async (req, res) => {
-  const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').order('start_time', { ascending: false });
+  const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
 app.get('/api/governance/active', async (req, res) => {
-  const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').eq('status', 'active').gt('end_time', new Date().toISOString());
+  const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').eq('status', 'active').gt('deadline', new Date().toISOString());
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -169,15 +157,17 @@ app.post('/api/governance', async (req, res) => {
 });
 
 app.post('/api/governance/vote', async (req, res) => {
-  const { proposalId, userId, support, weight } = req.body;
-  if (!proposalId || !userId) return res.status(400).json({ error: 'proposalId and userId required' });
-  const { data, error } = await supabase.from('votes').insert({ proposal_id: proposalId, user_id: userId, support, weight }).select().single();
+  const { proposalId, userId, option, votingPower } = req.body;
+  const { data: existing } = await supabase.from('votes').select('id').eq('proposal_id', proposalId).eq('user_id', userId).single();
+  if (existing) return res.status(400).json({ error: 'Already voted' });
+  const { data, error } = await supabase.from('votes').insert({ proposal_id: proposalId, user_id: userId, option, voting_power: votingPower || 1 }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
+// ─── MARKETPLACE ──────────────────────────────────────────
 app.get('/api/marketplace', async (req, res) => {
-  const { data, error } = await supabase.from('marketplace_listings').select('*, brands(name), users(wallet_address)').eq('active', true);
+  const { data, error } = await supabase.from('marketplace_listings').select('*, brands(name)').eq('status', 'active');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -188,11 +178,81 @@ app.post('/api/marketplace', async (req, res) => {
   res.json(data);
 });
 
-app.delete('/api/marketplace/:id', async (req, res) => {
-  const { data, error } = await supabase.from('marketplace_listings').update({ active: false }).eq('id', req.params.id).select().single();
+app.put('/api/marketplace/:id/purchase', async (req, res) => {
+  const { buyerWallet, txHash } = req.body;
+  const { data, error } = await supabase.from('marketplace_listings').update({ status: 'sold', buyer_wallet: buyerWallet, tx_hash: txHash, sold_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
+app.put('/api/marketplace/:id/cancel', async (req, res) => {
+  const { data, error } = await supabase.from('marketplace_listings').update({ status: 'cancelled' }).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// ─── MISSIONS ─────────────────────────────────────────────
+app.get('/api/missions', async (req, res) => {
+  const { city, mission_type, difficulty } = req.query;
+  let query = supabase.from('missions').select('*').eq('status', 'active').gt('deadline', new Date().toISOString()).order('created_at', { ascending: false });
+  if (city) query = query.eq('city', city);
+  if (mission_type) query = query.eq('mission_type', mission_type);
+  if (difficulty) query = query.eq('difficulty', difficulty);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get('/api/missions/:id', async (req, res) => {
+  const { data, error } = await supabase.from('missions').select('*').eq('id', req.params.id).single();
+  if (error) return res.status(404).json({ error: 'Mission not found' });
+  res.json(data);
+});
+
+app.post('/api/missions', async (req, res) => {
+  const { data, error } = await supabase.from('missions').insert(req.body).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/missions/:id/claim', async (req, res) => {
+  const { walletAddress, stakeTxHash } = req.body;
+  const { data: mission } = await supabase.from('missions').select('*').eq('id', req.params.id).single();
+  if (!mission || mission.status !== 'active') return res.status(400).json({ error: 'Mission not available' });
+  const { data, error } = await supabase.from('mission_claims').insert({ mission_id: req.params.id, agent_wallet: walletAddress, stake_tx_hash: stakeTxHash, stake_amount_bnb: mission.stake_required_bnb }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/missions/claims/:claimId/submit', async (req, res) => {
+  const { intel_text, intel_photos, intel_video_url, gps_lat, gps_lng } = req.body;
+  const { data, error } = await supabase.from('mission_claims').update({ status: 'submitted', intel_text, intel_photos, intel_video_url, gps_lat, gps_lng, gps_verified: !!(gps_lat && gps_lng), submitted_at: new Date().toISOString() }).eq('id', req.params.claimId).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/missions/claims/:claimId/approve', async (req, res) => {
+  const adminKey = req.headers['x-admin-key'];
+  if (adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const { error } = await supabase.rpc('approve_mission', { p_claim_id: req.params.claimId });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.get('/api/missions/agent/:wallet', async (req, res) => {
+  const [profileRes, claimsRes] = await Promise.all([
+    supabase.from('agent_profiles').select('*').eq('wallet_address', req.params.wallet).single(),
+    supabase.from('mission_claims').select('*, missions(codename, mission_type, city, reward_bnb, difficulty)').eq('agent_wallet', req.params.wallet).order('claimed_at', { ascending: false }).limit(20)
+  ]);
+  res.json({ profile: profileRes.data, missions: claimsRes.data });
+});
+
+app.get('/api/missions/leaderboard', async (req, res) => {
+  const { data, error } = await supabase.from('leaderboard_weekly').select('*').limit(20);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// ─── START ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log('LUXFI Backend running on port ' + PORT));
