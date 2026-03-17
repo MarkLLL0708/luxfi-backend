@@ -2,7 +2,9 @@
   "name": "luxfi-backend",
   "version": "1.0.0",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "lint": "eslint index.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.0.0",
@@ -19,6 +21,10 @@
     "winston": "^3.11.0",
     "express-validator": "^7.0.1",
     "axios": "^1.6.0",
-    "node-cron": "^3.0.0"
+    "prom-client": "^15.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "eslint": "^8.0.0"
   }
 }
