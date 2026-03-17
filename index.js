@@ -61,7 +61,10 @@ const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// ─── BSC RPC MULTI-PROVIDER ───────────────────────────────
+// ─── RETRY HELPER ─────────────────────────────────────────
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// ─── BSC RPC MULTI-PROVIDER + RETRY ──────────────────────
 const BSC_RPC_PROVIDERS = [
   process.env.BSC_RPC_URL || 'https://bsc-dataseed1.binance.org',
   'https://bsc-dataseed2.binance.org',
@@ -69,72 +72,75 @@ const BSC_RPC_PROVIDERS = [
   'https://bsc-dataseed4.binance.org',
 ];
 
-const getBSCProvider = async () => {
+const getBSCProvider = async (maxRetries = 3) => {
   for (const rpc of BSC_RPC_PROVIDERS) {
-    try {
-      const provider = new ethers.JsonRpcProvider(rpc);
-      await provider.getBlockNumber();
-      return provider;
-    } catch {
-      logger.warn({ message: 'RPC provider failed', rpc });
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const provider = new ethers.JsonRpcProvider(rpc);
+        await provider.getBlockNumber();
+        return provider;
+      } catch (err) {
+        logger.warn({ message: `RPC attempt ${attempt}/${maxRetries} failed`, rpc, err: err.message });
+        if (attempt < maxRetries) {
+          await sleep(Math.pow(2, attempt - 1) * 1000);
+        }
+      }
     }
   }
-  throw new Error('All RPC providers failed');
+  throw new Error('All RPC providers failed after retries');
 };
 
 // ─── MARKET DATA — FREE SOURCES ───────────────────────────
 const marketDataCache = new Map();
-const MARKET_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const MARKET_CACHE_TTL = 5 * 60 * 1000;
 
 const getBNBPrice = async () => {
   const cacheKey = 'bnb_price';
   const cached = marketDataCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) {
-    return cached.data;
-  }
+  if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) return cached.data;
 
-  try {
-    // CoinGecko free API — no key needed
-    const response = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd&include_24hr_change=true',
-      { timeout: 5000 }
-    );
-    const data = {
-      price: response.data.binancecoin.usd,
-      change24h: response.data.binancecoin.usd_24h_change,
-      source: 'coingecko',
-      timestamp: new Date().toISOString()
-    };
-    marketDataCache.set(cacheKey, { data, timestamp: Date.now() });
-    return data;
-  } catch (err) {
-    logger.warn({ message: 'CoinGecko failed, trying backup', err: err.message });
-    // Backup: Binance public API
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const backup = await axios.get('https://api.binance.com/api/v3/ticker/24hr?symbol=BNBUSDT', { timeout: 5000 });
+      const response = await axios.get(
+        'https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd&include_24hr_change=true',
+        { timeout: 5000 }
+      );
       const data = {
-        price: parseFloat(backup.data.lastPrice),
-        change24h: parseFloat(backup.data.priceChangePercent),
-        source: 'binance',
+        price: response.data.binancecoin.usd,
+        change24h: response.data.binancecoin.usd_24h_change,
+        source: 'coingecko',
         timestamp: new Date().toISOString()
       };
       marketDataCache.set(cacheKey, { data, timestamp: Date.now() });
       return data;
-    } catch {
-      throw new Error('All market data sources failed');
+    } catch (err) {
+      logger.warn({ message: `CoinGecko attempt ${attempt} failed`, err: err.message });
+      if (attempt < 3) await sleep(Math.pow(2, attempt - 1) * 1000);
     }
+  }
+
+  // Fallback to Binance
+  try {
+    const backup = await axios.get('https://api.binance.com/api/v3/ticker/24hr?symbol=BNBUSDT', { timeout: 5000 });
+    const data = {
+      price: parseFloat(backup.data.lastPrice),
+      change24h: parseFloat(backup.data.priceChangePercent),
+      source: 'binance',
+      timestamp: new Date().toISOString()
+    };
+    marketDataCache.set(cacheKey, { data, timestamp: Date.now() });
+    return data;
+  } catch {
+    throw new Error('All market data sources failed');
   }
 };
 
 const getBrandMarketData = async (brandName, city) => {
   const cacheKey = `brand_${brandName}_${city}`;
   const cached = marketDataCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) {
-    return cached.data;
-  }
+  if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) return cached.data;
 
   try {
-    // Use Claude to analyze with web search capability
     const data = await callClaudeWithFallback(
       `You are a market analyst for LUXFI platform. Provide a brief market intelligence report for:
 Brand: ${brandName}
@@ -155,23 +161,17 @@ Respond ONLY in JSON:
   "confidence": "low|medium|high",
   "dataSource": "ai_analysis",
   "disclaimer": "AI-generated analysis, not financial advice"
-}`,
-      500
+}`, 500
     );
-
     const parsed = JSON.parse(data);
     marketDataCache.set(cacheKey, { data: parsed, timestamp: Date.now() });
     return parsed;
   } catch (err) {
     logger.error({ message: 'Brand market data failed', err: err.message });
     return {
-      sentiment: 'neutral',
-      growthPotential: 5,
-      riskLevel: 'medium',
-      keyFactors: ['Data unavailable'],
-      confidence: 'low',
-      dataSource: 'fallback',
-      disclaimer: 'AI-generated analysis, not financial advice'
+      sentiment: 'neutral', growthPotential: 5, riskLevel: 'medium',
+      keyFactors: ['Data unavailable'], confidence: 'low',
+      dataSource: 'fallback', disclaimer: 'AI-generated analysis, not financial advice'
     };
   }
 };
@@ -188,9 +188,7 @@ const checkJurisdiction = async (req, res, next) => {
       return safeError(res, 403, 'Service not available in your region');
     }
     next();
-  } catch {
-    next();
-  }
+  } catch { next(); }
 };
 
 // ─── SECURITY MIDDLEWARE ──────────────────────────────────
@@ -241,8 +239,11 @@ const generateRequestId = () => crypto.randomBytes(8).toString('hex').toUpperCas
 // ─── CLAUDE API CACHE + FALLBACK ──────────────────────────
 const claudeCache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_TOKENS_LIMIT = 1000;
 
 const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
+  // Enforce response length limit
+  const limitedTokens = Math.min(maxTokens, MAX_TOKENS_LIMIT);
   const cacheKey = crypto.createHash('md5').update(prompt).digest('hex');
   const cached = claudeCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
@@ -252,28 +253,31 @@ const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
 
   const models = ['claude-sonnet-4-20250514', 'claude-haiku-4-5-20251001'];
 
-  for (const model of models) {
-    try {
-      const response = await axios.post(
-        'https://api.anthropic.com/v1/messages',
-        { model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] },
-        {
-          headers: {
-            'x-api-key': process.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json'
-          },
-          timeout: 30000
-        }
-      );
-      const result = response.data.content[0].text;
-      claudeCache.set(cacheKey, { response: result, timestamp: Date.now() });
-      return result;
-    } catch (err) {
-      logger.warn({ message: `Claude API failed with model ${model}`, err: err.message });
-      if (model === models[models.length - 1]) throw new Error('All Claude API models failed');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    for (const model of models) {
+      try {
+        const response = await axios.post(
+          'https://api.anthropic.com/v1/messages',
+          { model, max_tokens: limitedTokens, messages: [{ role: 'user', content: prompt }] },
+          {
+            headers: {
+              'x-api-key': process.env.ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+              'content-type': 'application/json'
+            },
+            timeout: 30000
+          }
+        );
+        const result = response.data.content[0].text;
+        claudeCache.set(cacheKey, { response: result, timestamp: Date.now() });
+        return result;
+      } catch (err) {
+        logger.warn({ message: `Claude API failed attempt ${attempt} model ${model}`, err: err.message });
+        if (attempt < 3) await sleep(Math.pow(2, attempt - 1) * 1000);
+      }
     }
   }
+  throw new Error('All Claude API attempts failed');
 };
 
 // ─── NONCE MANAGEMENT ─────────────────────────────────────
@@ -294,24 +298,31 @@ const validateAndConsumeNonce = async (nonce, walletAddress) => {
   return true;
 };
 
-// ─── ON-CHAIN TRANSACTION VERIFICATION ───────────────────
-const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3) => {
-  try {
-    const provider = await getBSCProvider();
-    const tx = await provider.getTransaction(txHash);
-    if (!tx) return { valid: false, reason: 'Transaction not found on chain' };
-    if (tx.from.toLowerCase() !== expectedFrom.toLowerCase()) return { valid: false, reason: 'Transaction sender mismatch' };
-    const receipt = await provider.getTransactionReceipt(txHash);
-    if (!receipt) return { valid: false, reason: 'Transaction not confirmed' };
-    if (!receipt.status) return { valid: false, reason: 'Transaction failed on chain' };
-    const currentBlock = await provider.getBlockNumber();
-    const confirmations = currentBlock - receipt.blockNumber;
-    if (confirmations < minConfirmations) return { valid: false, reason: `Insufficient confirmations: ${confirmations}/${minConfirmations}` };
-    return { valid: true, confirmations, blockNumber: receipt.blockNumber };
-  } catch (err) {
-    logger.error({ message: 'Transaction verification failed', err: err.message });
-    return { valid: false, reason: 'Verification service unavailable' };
+// ─── ON-CHAIN TRANSACTION VERIFICATION + RETRY ───────────
+const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3, maxRetries = 3) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const provider = await getBSCProvider();
+      const tx = await provider.getTransaction(txHash);
+      if (!tx) return { valid: false, reason: 'Transaction not found on chain' };
+      if (tx.from.toLowerCase() !== expectedFrom.toLowerCase()) return { valid: false, reason: 'Transaction sender mismatch' };
+      const receipt = await provider.getTransactionReceipt(txHash);
+      if (!receipt) return { valid: false, reason: 'Transaction not confirmed' };
+      if (!receipt.status) return { valid: false, reason: 'Transaction failed on chain' };
+      const currentBlock = await provider.getBlockNumber();
+      const confirmations = currentBlock - receipt.blockNumber;
+      if (confirmations < minConfirmations) return { valid: false, reason: `Insufficient confirmations: ${confirmations}/${minConfirmations}` };
+      return { valid: true, confirmations, blockNumber: receipt.blockNumber };
+    } catch (err) {
+      logger.error({ message: `Transaction verification attempt ${attempt} failed`, err: err.message });
+      if (attempt < maxRetries) {
+        await sleep(Math.pow(2, attempt - 1) * 1000);
+      } else {
+        return { valid: false, reason: 'Verification service unavailable after retries' };
+      }
+    }
   }
+  return { valid: false, reason: 'Verification failed' };
 };
 
 // ─── TRANSACTION MONITORING ───────────────────────────────
@@ -371,9 +382,7 @@ v1.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', versi
 // ─── PROMETHEUS METRICS ENDPOINT ─────────────────────────
 app.get('/metrics', async (req, res) => {
   const adminKey = req.headers['x-admin-key'];
-  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   res.set('Content-Type', promClient.register.contentType);
   res.end(await promClient.register.metrics());
 });
