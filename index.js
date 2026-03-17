@@ -42,7 +42,6 @@ const BSC_RPC_PROVIDERS = [
   'https://bsc-dataseed4.binance.org',
 ];
 
-// Get BSC provider with fallback
 const getBSCProvider = async () => {
   for (const rpc of BSC_RPC_PROVIDERS) {
     try {
@@ -69,12 +68,11 @@ const checkJurisdiction = async (req, res, next) => {
     }
     next();
   } catch {
-    next(); // allow through if geo check fails
+    next();
   }
 };
 
 // ─── SECURITY MIDDLEWARE ──────────────────────────────────
-Sentry.setupExpressErrorHandler(app);
 app.use(helmet({ contentSecurityPolicy: true, crossOriginEmbedderPolicy: true }));
 
 const allowedOrigins = process.env.NODE_ENV === 'production'
@@ -115,7 +113,7 @@ const generateNonce = async (walletAddress) => {
   const { error } = await supabase.from('auth_nonces').insert({
     nonce,
     wallet_address: walletAddress,
-    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString() // 5 min expiry
+    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString()
   });
   if (error) throw new Error('Failed to generate nonce');
   return nonce;
@@ -133,7 +131,6 @@ const validateAndConsumeNonce = async (nonce, walletAddress) => {
 
   if (error || !data) return false;
 
-  // Mark nonce as used
   await supabase
     .from('auth_nonces')
     .update({ is_used: true, used_at: new Date().toISOString() })
@@ -146,17 +143,13 @@ const validateAndConsumeNonce = async (nonce, walletAddress) => {
 const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3) => {
   try {
     const provider = await getBSCProvider();
-
-    // Get transaction
     const tx = await provider.getTransaction(txHash);
     if (!tx) return { valid: false, reason: 'Transaction not found on chain' };
 
-    // Verify sender matches
     if (tx.from.toLowerCase() !== expectedFrom.toLowerCase()) {
       return { valid: false, reason: 'Transaction sender mismatch' };
     }
 
-    // Check confirmations
     const receipt = await provider.getTransactionReceipt(txHash);
     if (!receipt) return { valid: false, reason: 'Transaction not confirmed' };
     if (!receipt.status) return { valid: false, reason: 'Transaction failed on chain' };
@@ -176,11 +169,6 @@ const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3) => 
 };
 
 // ─── TRANSACTION MONITORING ───────────────────────────────
-const SUSPICIOUS_PATTERNS = {
-  MAX_TRANSACTIONS_PER_HOUR: 50,
-  MAX_CLAIMS_PER_DAY: 5,
-};
-
 const transactionMonitor = async (walletAddress, action) => {
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
@@ -190,7 +178,7 @@ const transactionMonitor = async (walletAddress, action) => {
       .eq('user_wallet', walletAddress)
       .gte('created_at', oneHourAgo);
 
-    if (count > SUSPICIOUS_PATTERNS.MAX_TRANSACTIONS_PER_HOUR) {
+    if (count > 50) {
       logger.warn({ message: 'Suspicious activity', walletAddress, action, count });
       await supabase.from('audit_logs').insert({
         wallet_address: walletAddress,
@@ -249,13 +237,10 @@ app.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', vers
 v1.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
 
 // ─── AUTH ─────────────────────────────────────────────────
-
-// Step 1: Request nonce
 v1.post('/auth/nonce', authLimiter, async (req, res) => {
   const { walletAddress } = sanitize(req.body);
   if (!walletAddress) return safeError(res, 400, 'walletAddress required');
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
-
   try {
     const nonce = await generateNonce(walletAddress);
     res.json({
@@ -267,7 +252,6 @@ v1.post('/auth/nonce', authLimiter, async (req, res) => {
   }
 });
 
-// Step 2: Login with signed nonce
 v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   const { walletAddress, signature, nonce } = sanitize(req.body);
 
@@ -279,14 +263,12 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
     return safeError(res, 400, 'Invalid wallet address format');
   }
 
-  // Validate and consume nonce — prevents replay attacks
   const nonceValid = await validateAndConsumeNonce(nonce, walletAddress);
   if (!nonceValid) {
     await auditLog('FAILED_LOGIN', walletAddress, { reason: 'Invalid or expired nonce' }, 'WARN');
     return safeError(res, 401, 'Invalid or expired nonce');
   }
 
-  // Reconstruct message and verify signature
   const message = `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${Date.now()}`;
   try {
     const recovered = ethers.verifyMessage(message, signature);
@@ -416,7 +398,6 @@ v1.post('/transactions', authenticateToken, async (req, res) => {
     const body = sanitize(req.body);
     if (!body.brand_id || !body.amount) return safeError(res, 400, 'brand_id and amount required');
 
-    // Verify transaction on-chain if txHash provided
     if (body.tx_hash) {
       const verification = await verifyTransaction(body.tx_hash, req.user.walletAddress);
       if (!verification.valid) {
@@ -429,8 +410,7 @@ v1.post('/transactions', authenticateToken, async (req, res) => {
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
 
     const { data, error } = await supabase.from('transactions').insert({
-      ...body,
-      user_wallet: req.user.walletAddress
+      ...body, user_wallet: req.user.walletAddress
     }).select().single();
     if (error) return safeError(res, 500, 'Failed to create transaction');
     await auditLog('CREATE_TRANSACTION', req.user.walletAddress, { amount: body.amount, brandId: body.brand_id }, 'INFO');
@@ -460,10 +440,8 @@ v1.post('/rewards/claim', authenticateToken, async (req, res) => {
   try {
     const { poolId, userId } = sanitize(req.body);
     if (!poolId || !userId) return safeError(res, 400, 'poolId and userId required');
-
     const suspicious = await transactionMonitor(req.user.walletAddress, 'CLAIM_REWARD');
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
-
     const { data, error } = await supabase.from('reward_claims').update({
       status: 'claimed', claimed_at: new Date().toISOString()
     }).eq('reward_pool_id', poolId).eq('user_id', userId).select().single();
@@ -545,7 +523,6 @@ v1.put('/marketplace/:id/purchase', authenticateToken, async (req, res) => {
     if (!/^0x[a-fA-F0-9]{40}$/.test(buyerWallet)) return safeError(res, 400, 'Invalid wallet address');
     if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) return safeError(res, 400, 'Invalid transaction hash');
 
-    // Verify transaction on-chain
     const verification = await verifyTransaction(txHash, buyerWallet);
     if (!verification.valid) {
       await auditLog('INVALID_PURCHASE_TX', buyerWallet, { txHash, reason: verification.reason }, 'WARN');
@@ -622,7 +599,6 @@ v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
     if (!walletAddress) return safeError(res, 400, 'walletAddress required');
     if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
 
-    // Verify stake transaction on-chain
     if (stakeTxHash) {
       const verification = await verifyTransaction(stakeTxHash, walletAddress);
       if (!verification.valid) {
@@ -704,7 +680,6 @@ v1.get('/admin/suspicious', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// Verify transaction endpoint
 v1.post('/admin/verify-tx', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -717,13 +692,13 @@ v1.post('/admin/verify-tx', async (req, res) => {
 });
 
 // ─── SCHEDULED JOBS ───────────────────────────────────────
-// Clean up expired nonces every 30 minutes
 cron.schedule('*/30 * * * *', async () => {
   try {
     await supabase.rpc('cleanup_expired_nonces');
     logger.info({ message: 'Expired nonces cleaned up' });
   } catch (err) {
     logger.error({ message: 'Nonce cleanup failed', err: err.message });
+    Sentry.captureException(err);
   }
 });
 
