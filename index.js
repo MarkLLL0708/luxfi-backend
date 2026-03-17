@@ -10,7 +10,6 @@ const xss = require('xss');
 const winston = require('winston');
 const Sentry = require('@sentry/node');
 const axios = require('axios');
-const cron = require('node-cron');
 const crypto = require('crypto');
 
 // ─── SENTRY ───────────────────────────────────────────────
@@ -129,11 +128,7 @@ const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
     try {
       const response = await axios.post(
         'https://api.anthropic.com/v1/messages',
-        {
-          model,
-          max_tokens: maxTokens,
-          messages: [{ role: 'user', content: prompt }]
-        },
+        { model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] },
         {
           headers: {
             'x-api-key': process.env.ANTHROPIC_API_KEY,
@@ -143,15 +138,12 @@ const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
           timeout: 30000
         }
       );
-
       const result = response.data.content[0].text;
       claudeCache.set(cacheKey, { response: result, timestamp: Date.now() });
       return result;
     } catch (err) {
       logger.warn({ message: `Claude API failed with model ${model}`, err: err.message });
-      if (model === models[models.length - 1]) {
-        throw new Error('All Claude API models failed');
-      }
+      if (model === models[models.length - 1]) throw new Error('All Claude API models failed');
     }
   }
 };
@@ -177,14 +169,8 @@ const validateAndConsumeNonce = async (nonce, walletAddress) => {
     .eq('is_used', false)
     .gt('expires_at', new Date().toISOString())
     .single();
-
   if (error || !data) return false;
-
-  await supabase
-    .from('auth_nonces')
-    .update({ is_used: true, used_at: new Date().toISOString() })
-    .eq('id', data.id);
-
+  await supabase.from('auth_nonces').update({ is_used: true, used_at: new Date().toISOString() }).eq('id', data.id);
   return true;
 };
 
@@ -194,22 +180,13 @@ const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3) => 
     const provider = await getBSCProvider();
     const tx = await provider.getTransaction(txHash);
     if (!tx) return { valid: false, reason: 'Transaction not found on chain' };
-
-    if (tx.from.toLowerCase() !== expectedFrom.toLowerCase()) {
-      return { valid: false, reason: 'Transaction sender mismatch' };
-    }
-
+    if (tx.from.toLowerCase() !== expectedFrom.toLowerCase()) return { valid: false, reason: 'Transaction sender mismatch' };
     const receipt = await provider.getTransactionReceipt(txHash);
     if (!receipt) return { valid: false, reason: 'Transaction not confirmed' };
     if (!receipt.status) return { valid: false, reason: 'Transaction failed on chain' };
-
     const currentBlock = await provider.getBlockNumber();
     const confirmations = currentBlock - receipt.blockNumber;
-
-    if (confirmations < minConfirmations) {
-      return { valid: false, reason: `Insufficient confirmations: ${confirmations}/${minConfirmations}` };
-    }
-
+    if (confirmations < minConfirmations) return { valid: false, reason: `Insufficient confirmations: ${confirmations}/${minConfirmations}` };
     return { valid: true, confirmations, blockNumber: receipt.blockNumber };
   } catch (err) {
     logger.error({ message: 'Transaction verification failed', err: err.message });
@@ -221,20 +198,10 @@ const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3) => 
 const transactionMonitor = async (walletAddress, action) => {
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const { count } = await supabase
-      .from('transactions')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_wallet', walletAddress)
-      .gte('created_at', oneHourAgo);
-
+    const { count } = await supabase.from('transactions').select('*', { count: 'exact', head: true }).eq('user_wallet', walletAddress).gte('created_at', oneHourAgo);
     if (count > 50) {
       logger.warn({ message: 'Suspicious activity', walletAddress, action, count });
-      await supabase.from('audit_logs').insert({
-        wallet_address: walletAddress,
-        action: 'SUSPICIOUS_ACTIVITY',
-        details: { count, action },
-        severity: 'HIGH'
-      });
+      await supabase.from('audit_logs').insert({ wallet_address: walletAddress, action: 'SUSPICIOUS_ACTIVITY', details: { count, action }, severity: 'HIGH' });
       return true;
     }
     return false;
@@ -244,11 +211,7 @@ const transactionMonitor = async (walletAddress, action) => {
 // ─── AUDIT LOG ────────────────────────────────────────────
 const auditLog = async (action, walletAddress, details, severity = 'INFO') => {
   try {
-    await supabase.from('audit_logs').insert({
-      action, wallet_address: walletAddress,
-      details: JSON.stringify(details), severity,
-      created_at: new Date().toISOString()
-    });
+    await supabase.from('audit_logs').insert({ action, wallet_address: walletAddress, details: JSON.stringify(details), severity, created_at: new Date().toISOString() });
   } catch (err) {
     logger.error({ message: 'Audit log failed', err: err.message });
   }
@@ -292,10 +255,7 @@ v1.post('/auth/nonce', authLimiter, async (req, res) => {
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
   try {
     const nonce = await generateNonce(walletAddress);
-    res.json({
-      nonce,
-      message: `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${Date.now()}`
-    });
+    res.json({ nonce, message: `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${Date.now()}` });
   } catch {
     return safeError(res, 500, 'Failed to generate nonce');
   }
@@ -305,13 +265,11 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   const { walletAddress, signature, nonce } = sanitize(req.body);
   if (!signature || !nonce || !walletAddress) return safeError(res, 400, 'walletAddress, signature and nonce required');
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address format');
-
   const nonceValid = await validateAndConsumeNonce(nonce, walletAddress);
   if (!nonceValid) {
     await auditLog('FAILED_LOGIN', walletAddress, { reason: 'Invalid or expired nonce' }, 'WARN');
     return safeError(res, 401, 'Invalid or expired nonce');
   }
-
   const message = `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${Date.now()}`;
   try {
     const recovered = ethers.verifyMessage(message, signature);
@@ -322,7 +280,6 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   } catch {
     return safeError(res, 401, 'Signature verification failed');
   }
-
   try {
     const { data: existing } = await supabase.from('users').select('*').eq('wallet_address', walletAddress).single();
     let user = existing;
@@ -676,21 +633,17 @@ v1.post('/ai/generate-mission', async (req, res) => {
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
     const { brand, missionType, city, difficulty } = sanitize(req.body);
     if (!brand || !missionType || !city) return safeError(res, 400, 'brand, missionType and city required');
-
     const prompt = `You are the AI agent behind LUXFI, a blockchain platform tokenizing real-world lifestyle brands in Southeast Asia. Generate a dramatic spy-style mission briefing.
-
 Brand: ${brand}
 Mission Type: ${missionType}
 City: ${city}
 Difficulty: ${difficulty || 'ROUTINE'}
-
 Return ONLY a JSON object with no markdown, no backticks:
 {
   "codename": "OPERATION [DRAMATIC TWO WORD NAME IN CAPS]",
   "briefing": "3 sentences in spy AI voice. Address the agent directly. Reference the brand and city. Create urgency.",
   "requirements": ["Requirement 1", "Requirement 2", "Requirement 3", "Requirement 4"]
 }`;
-
     const result = await callClaudeWithFallback(prompt);
     const mission = JSON.parse(result);
     await auditLog('GENERATE_MISSION', 'admin', { brand, city }, 'INFO');
@@ -734,18 +687,15 @@ v1.post('/admin/verify-tx', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── ANOMALY MONITORING ───────────────────────────────────
 v1.get('/admin/anomalies', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
-
     const [highSeverity, recentLogins, suspiciousActivity] = await Promise.all([
       supabase.from('audit_logs').select('*').eq('severity', 'HIGH').order('created_at', { ascending: false }).limit(20),
       supabase.from('audit_logs').select('*').eq('action', 'FAILED_LOGIN').gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()),
       supabase.from('suspicious_activity').select('*').eq('resolved', false).order('created_at', { ascending: false }).limit(20)
     ]);
-
     res.json({
       highSeverityEvents: highSeverity.data || [],
       failedLoginsLast24h: recentLogins.data?.length || 0,
@@ -756,7 +706,7 @@ v1.get('/admin/anomalies', async (req, res) => {
 });
 
 // ─── SCHEDULED JOBS ───────────────────────────────────────
-cron.schedule('*/30 * * * *', async () => {
+setInterval(async () => {
   try {
     await supabase.rpc('cleanup_expired_nonces');
     logger.info({ message: 'Expired nonces cleaned up' });
@@ -764,10 +714,9 @@ cron.schedule('*/30 * * * *', async () => {
     logger.error({ message: 'Nonce cleanup failed', err: err.message });
     Sentry.captureException(err);
   }
-});
+}, 30 * 60 * 1000);
 
-// Update time-weighted scores every hour
-cron.schedule('0 * * * *', async () => {
+setInterval(async () => {
   try {
     await supabase.rpc('update_all_time_weighted_scores');
     logger.info({ message: 'Time-weighted scores updated' });
@@ -775,7 +724,7 @@ cron.schedule('0 * * * *', async () => {
     logger.error({ message: 'Score update failed', err: err.message });
     Sentry.captureException(err);
   }
-});
+}, 60 * 60 * 1000);
 
 // ─── 404 HANDLER ─────────────────────────────────────────
 app.use((req, res) => safeError(res, 404, 'Route not found'));
@@ -790,10 +739,3 @@ app.use((err, req, res, next) => {
 // ─── START ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
-```
-
-Delete old code → paste → **Commit changes** ✅
-
-Also add to Railway Variables:
-```
-ANTHROPIC_API_KEY = your-anthropic-api-key
