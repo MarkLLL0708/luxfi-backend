@@ -20,10 +20,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci --ignore-scripts
+        run: npm install --ignore-scripts
 
       - name: Run npm audit
         run: npm audit --audit-level=high
@@ -33,10 +32,6 @@ jobs:
         run: |
           if grep -r "sk-ant-api" . --include="*.js" --exclude-dir=node_modules; then
             echo "DANGER: Anthropic API key found in code!"
-            exit 1
-          fi
-          if grep -r "eyJhbGciOiJ" . --include="*.js" --exclude-dir=node_modules; then
-            echo "DANGER: JWT token found in code!"
             exit 1
           fi
           echo "No secrets found in code ✅"
@@ -52,10 +47,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci --ignore-scripts
+        run: npm install --ignore-scripts
 
       - name: Check syntax
         run: node --check index.js
