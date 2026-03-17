@@ -11,12 +11,40 @@ const winston = require('winston');
 const Sentry = require('@sentry/node');
 const axios = require('axios');
 const crypto = require('crypto');
+const promClient = require('prom-client');
 
 // ─── SENTRY ───────────────────────────────────────────────
 Sentry.init({
   dsn: process.env.SENTRY_DSN,
   environment: process.env.NODE_ENV || 'production',
   tracesSampleRate: 1.0,
+});
+
+// ─── PROMETHEUS METRICS ───────────────────────────────────
+const collectDefaultMetrics = promClient.collectDefaultMetrics;
+collectDefaultMetrics();
+
+const httpRequestCounter = new promClient.Counter({
+  name: 'luxfi_http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['method', 'route', 'status']
+});
+
+const httpRequestDuration = new promClient.Histogram({
+  name: 'luxfi_http_request_duration_seconds',
+  help: 'HTTP request duration',
+  labelNames: ['method', 'route']
+});
+
+const activeUsers = new promClient.Gauge({
+  name: 'luxfi_active_users',
+  help: 'Number of active users'
+});
+
+const transactionCounter = new promClient.Counter({
+  name: 'luxfi_transactions_total',
+  help: 'Total transactions processed',
+  labelNames: ['type', 'status']
 });
 
 // ─── LOGGER ───────────────────────────────────────────────
@@ -52,6 +80,100 @@ const getBSCProvider = async () => {
     }
   }
   throw new Error('All RPC providers failed');
+};
+
+// ─── MARKET DATA — FREE SOURCES ───────────────────────────
+const marketDataCache = new Map();
+const MARKET_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+const getBNBPrice = async () => {
+  const cacheKey = 'bnb_price';
+  const cached = marketDataCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) {
+    return cached.data;
+  }
+
+  try {
+    // CoinGecko free API — no key needed
+    const response = await axios.get(
+      'https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd&include_24hr_change=true',
+      { timeout: 5000 }
+    );
+    const data = {
+      price: response.data.binancecoin.usd,
+      change24h: response.data.binancecoin.usd_24h_change,
+      source: 'coingecko',
+      timestamp: new Date().toISOString()
+    };
+    marketDataCache.set(cacheKey, { data, timestamp: Date.now() });
+    return data;
+  } catch (err) {
+    logger.warn({ message: 'CoinGecko failed, trying backup', err: err.message });
+    // Backup: Binance public API
+    try {
+      const backup = await axios.get('https://api.binance.com/api/v3/ticker/24hr?symbol=BNBUSDT', { timeout: 5000 });
+      const data = {
+        price: parseFloat(backup.data.lastPrice),
+        change24h: parseFloat(backup.data.priceChangePercent),
+        source: 'binance',
+        timestamp: new Date().toISOString()
+      };
+      marketDataCache.set(cacheKey, { data, timestamp: Date.now() });
+      return data;
+    } catch {
+      throw new Error('All market data sources failed');
+    }
+  }
+};
+
+const getBrandMarketData = async (brandName, city) => {
+  const cacheKey = `brand_${brandName}_${city}`;
+  const cached = marketDataCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) {
+    return cached.data;
+  }
+
+  try {
+    // Use Claude to analyze with web search capability
+    const data = await callClaudeWithFallback(
+      `You are a market analyst for LUXFI platform. Provide a brief market intelligence report for:
+Brand: ${brandName}
+Location: ${city}
+
+Based on general knowledge about this type of brand in this market, provide:
+1. Market sentiment (bullish/neutral/bearish)
+2. Growth potential (1-10)
+3. Risk level (low/medium/high)
+4. Key market factors (2-3 bullet points)
+
+Respond ONLY in JSON:
+{
+  "sentiment": "bullish|neutral|bearish",
+  "growthPotential": 7,
+  "riskLevel": "low|medium|high",
+  "keyFactors": ["factor1", "factor2"],
+  "confidence": "low|medium|high",
+  "dataSource": "ai_analysis",
+  "disclaimer": "AI-generated analysis, not financial advice"
+}`,
+      500
+    );
+
+    const parsed = JSON.parse(data);
+    marketDataCache.set(cacheKey, { data: parsed, timestamp: Date.now() });
+    return parsed;
+  } catch (err) {
+    logger.error({ message: 'Brand market data failed', err: err.message });
+    return {
+      sentiment: 'neutral',
+      growthPotential: 5,
+      riskLevel: 'medium',
+      keyFactors: ['Data unavailable'],
+      confidence: 'low',
+      dataSource: 'fallback',
+      disclaimer: 'AI-generated analysis, not financial advice'
+    };
+  }
 };
 
 // ─── JURISDICTION BLOCKING ────────────────────────────────
@@ -90,6 +212,16 @@ const authLimiter = rateLimit({
   message: { error: 'Too many login attempts' }
 });
 
+// ─── PROMETHEUS MIDDLEWARE ────────────────────────────────
+app.use((req, res, next) => {
+  const end = httpRequestDuration.startTimer({ method: req.method, route: req.path });
+  res.on('finish', () => {
+    httpRequestCounter.inc({ method: req.method, route: req.path, status: res.statusCode });
+    end();
+  });
+  next();
+});
+
 // ─── HELPERS ─────────────────────────────────────────────
 const sanitize = (obj) => {
   if (typeof obj === 'string') return xss(obj.trim());
@@ -112,17 +244,13 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 
 const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
   const cacheKey = crypto.createHash('md5').update(prompt).digest('hex');
-
   const cached = claudeCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
     logger.info({ message: 'Claude API cache hit' });
     return cached.response;
   }
 
-  const models = [
-    'claude-sonnet-4-20250514',
-    'claude-haiku-4-5-20251001'
-  ];
+  const models = ['claude-sonnet-4-20250514', 'claude-haiku-4-5-20251001'];
 
   for (const model of models) {
     try {
@@ -152,8 +280,7 @@ const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
 const generateNonce = async (walletAddress) => {
   const nonce = crypto.randomBytes(32).toString('hex');
   const { error } = await supabase.from('auth_nonces').insert({
-    nonce,
-    wallet_address: walletAddress,
+    nonce, wallet_address: walletAddress,
     expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString()
   });
   if (error) throw new Error('Failed to generate nonce');
@@ -161,14 +288,7 @@ const generateNonce = async (walletAddress) => {
 };
 
 const validateAndConsumeNonce = async (nonce, walletAddress) => {
-  const { data, error } = await supabase
-    .from('auth_nonces')
-    .select('*')
-    .eq('nonce', nonce)
-    .eq('wallet_address', walletAddress)
-    .eq('is_used', false)
-    .gt('expires_at', new Date().toISOString())
-    .single();
+  const { data, error } = await supabase.from('auth_nonces').select('*').eq('nonce', nonce).eq('wallet_address', walletAddress).eq('is_used', false).gt('expires_at', new Date().toISOString()).single();
   if (error || !data) return false;
   await supabase.from('auth_nonces').update({ is_used: true, used_at: new Date().toISOString() }).eq('id', data.id);
   return true;
@@ -248,6 +368,38 @@ app.use('/api', v1);
 app.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
 v1.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
 
+// ─── PROMETHEUS METRICS ENDPOINT ─────────────────────────
+app.get('/metrics', async (req, res) => {
+  const adminKey = req.headers['x-admin-key'];
+  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  res.set('Content-Type', promClient.register.contentType);
+  res.end(await promClient.register.metrics());
+});
+
+// ─── MARKET DATA ENDPOINTS ────────────────────────────────
+v1.get('/market/bnb-price', async (req, res) => {
+  try {
+    const data = await getBNBPrice();
+    res.json(data);
+  } catch (err) {
+    return safeError(res, 500, 'Failed to fetch BNB price');
+  }
+});
+
+v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
+  try {
+    const brandId = sanitize(req.params.brandId);
+    const { data: brand } = await supabase.from('brands').select('name, city').eq('id', brandId).single();
+    if (!brand) return safeError(res, 404, 'Brand not found');
+    const marketData = await getBrandMarketData(brand.name, brand.city);
+    res.json({ brand: brand.name, city: brand.city, ...marketData });
+  } catch (err) {
+    return safeError(res, 500, 'Failed to fetch brand market data');
+  }
+});
+
 // ─── AUTH ─────────────────────────────────────────────────
 v1.post('/auth/nonce', authLimiter, async (req, res) => {
   const { walletAddress } = sanitize(req.body);
@@ -290,6 +442,7 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
     }
     const token = jwt.sign({ userId: user.id, walletAddress: user.wallet_address }, JWT_SECRET, { expiresIn: '7d' });
     await auditLog('LOGIN', walletAddress, { userId: user.id }, 'INFO');
+    activeUsers.inc();
     res.json({ token, user });
   } catch {
     return safeError(res, 500, 'Authentication failed');
@@ -401,6 +554,7 @@ v1.post('/transactions', authenticateToken, async (req, res) => {
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
     const { data, error } = await supabase.from('transactions').insert({ ...body, user_wallet: req.user.walletAddress }).select().single();
     if (error) return safeError(res, 500, 'Failed to create transaction');
+    transactionCounter.inc({ type: body.type || 'general', status: 'success' });
     await auditLog('CREATE_TRANSACTION', req.user.walletAddress, { amount: body.amount, brandId: body.brand_id }, 'INFO');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
