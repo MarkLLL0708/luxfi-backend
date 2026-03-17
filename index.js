@@ -13,7 +13,7 @@ const axios = require('axios');
 const cron = require('node-cron');
 const crypto = require('crypto');
 
-// ─── SENTRY ERROR TRACKING ────────────────────────────────
+// ─── SENTRY ───────────────────────────────────────────────
 Sentry.init({
   dsn: process.env.SENTRY_DSN,
   environment: process.env.NODE_ENV || 'production',
@@ -34,7 +34,7 @@ const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// BSC RPC endpoints — multi-provider fallback
+// ─── BSC RPC MULTI-PROVIDER ───────────────────────────────
 const BSC_RPC_PROVIDERS = [
   process.env.BSC_RPC_URL || 'https://bsc-dataseed1.binance.org',
   'https://bsc-dataseed2.binance.org',
@@ -49,7 +49,7 @@ const getBSCProvider = async () => {
       await provider.getBlockNumber();
       return provider;
     } catch {
-      logger.warn({ message: 'RPC provider failed, trying next', rpc });
+      logger.warn({ message: 'RPC provider failed', rpc });
     }
   }
   throw new Error('All RPC providers failed');
@@ -106,6 +106,55 @@ const safeError = (res, status, message) => {
 };
 
 const generateRequestId = () => crypto.randomBytes(8).toString('hex').toUpperCase();
+
+// ─── CLAUDE API CACHE + FALLBACK ──────────────────────────
+const claudeCache = new Map();
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
+  const cacheKey = crypto.createHash('md5').update(prompt).digest('hex');
+
+  const cached = claudeCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    logger.info({ message: 'Claude API cache hit' });
+    return cached.response;
+  }
+
+  const models = [
+    'claude-sonnet-4-20250514',
+    'claude-haiku-4-5-20251001'
+  ];
+
+  for (const model of models) {
+    try {
+      const response = await axios.post(
+        'https://api.anthropic.com/v1/messages',
+        {
+          model,
+          max_tokens: maxTokens,
+          messages: [{ role: 'user', content: prompt }]
+        },
+        {
+          headers: {
+            'x-api-key': process.env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json'
+          },
+          timeout: 30000
+        }
+      );
+
+      const result = response.data.content[0].text;
+      claudeCache.set(cacheKey, { response: result, timestamp: Date.now() });
+      return result;
+    } catch (err) {
+      logger.warn({ message: `Claude API failed with model ${model}`, err: err.message });
+      if (model === models[models.length - 1]) {
+        throw new Error('All Claude API models failed');
+      }
+    }
+  }
+};
 
 // ─── NONCE MANAGEMENT ─────────────────────────────────────
 const generateNonce = async (walletAddress) => {
@@ -254,14 +303,8 @@ v1.post('/auth/nonce', authLimiter, async (req, res) => {
 
 v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   const { walletAddress, signature, nonce } = sanitize(req.body);
-
-  if (!signature || !nonce || !walletAddress) {
-    return safeError(res, 400, 'walletAddress, signature and nonce required');
-  }
-
-  if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
-    return safeError(res, 400, 'Invalid wallet address format');
-  }
+  if (!signature || !nonce || !walletAddress) return safeError(res, 400, 'walletAddress, signature and nonce required');
+  if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address format');
 
   const nonceValid = await validateAndConsumeNonce(nonce, walletAddress);
   if (!nonceValid) {
@@ -283,19 +326,12 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   try {
     const { data: existing } = await supabase.from('users').select('*').eq('wallet_address', walletAddress).single();
     let user = existing;
-
     if (!user) {
       const { data, error } = await supabase.from('users').insert({ wallet_address: walletAddress }).select().single();
       if (error) return safeError(res, 500, 'Failed to create user');
       user = data;
     }
-
-    const token = jwt.sign(
-      { userId: user.id, walletAddress: user.wallet_address },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
+    const token = jwt.sign({ userId: user.id, walletAddress: user.wallet_address }, JWT_SECRET, { expiresIn: '7d' });
     await auditLog('LOGIN', walletAddress, { userId: user.id }, 'INFO');
     res.json({ token, user });
   } catch {
@@ -397,7 +433,6 @@ v1.post('/transactions', authenticateToken, async (req, res) => {
   try {
     const body = sanitize(req.body);
     if (!body.brand_id || !body.amount) return safeError(res, 400, 'brand_id and amount required');
-
     if (body.tx_hash) {
       const verification = await verifyTransaction(body.tx_hash, req.user.walletAddress);
       if (!verification.valid) {
@@ -405,13 +440,9 @@ v1.post('/transactions', authenticateToken, async (req, res) => {
         return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
       }
     }
-
     const suspicious = await transactionMonitor(req.user.walletAddress, 'CREATE_TRANSACTION');
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
-
-    const { data, error } = await supabase.from('transactions').insert({
-      ...body, user_wallet: req.user.walletAddress
-    }).select().single();
+    const { data, error } = await supabase.from('transactions').insert({ ...body, user_wallet: req.user.walletAddress }).select().single();
     if (error) return safeError(res, 500, 'Failed to create transaction');
     await auditLog('CREATE_TRANSACTION', req.user.walletAddress, { amount: body.amount, brandId: body.brand_id }, 'INFO');
     res.json(data);
@@ -442,9 +473,7 @@ v1.post('/rewards/claim', authenticateToken, async (req, res) => {
     if (!poolId || !userId) return safeError(res, 400, 'poolId and userId required');
     const suspicious = await transactionMonitor(req.user.walletAddress, 'CLAIM_REWARD');
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
-    const { data, error } = await supabase.from('reward_claims').update({
-      status: 'claimed', claimed_at: new Date().toISOString()
-    }).eq('reward_pool_id', poolId).eq('user_id', userId).select().single();
+    const { data, error } = await supabase.from('reward_claims').update({ status: 'claimed', claimed_at: new Date().toISOString() }).eq('reward_pool_id', poolId).eq('user_id', userId).select().single();
     if (error) return safeError(res, 500, 'Failed to claim reward');
     await auditLog('CLAIM_REWARD', req.user.walletAddress, { poolId, userId }, 'INFO');
     res.json(data);
@@ -485,9 +514,7 @@ v1.post('/governance/vote', authenticateToken, async (req, res) => {
     if (!proposalId || !userId || !option) return safeError(res, 400, 'proposalId, userId and option required');
     const { data: existing } = await supabase.from('votes').select('id').eq('proposal_id', proposalId).eq('user_id', userId).single();
     if (existing) return safeError(res, 400, 'Already voted on this proposal');
-    const { data, error } = await supabase.from('votes').insert({
-      proposal_id: proposalId, user_id: userId, option, voting_power: votingPower || 1
-    }).select().single();
+    const { data, error } = await supabase.from('votes').insert({ proposal_id: proposalId, user_id: userId, option, voting_power: votingPower || 1 }).select().single();
     if (error) return safeError(res, 500, 'Failed to cast vote');
     await auditLog('CAST_VOTE', req.user.walletAddress, { proposalId, option }, 'INFO');
     res.json(data);
@@ -522,19 +549,14 @@ v1.put('/marketplace/:id/purchase', authenticateToken, async (req, res) => {
     if (!buyerWallet || !txHash) return safeError(res, 400, 'buyerWallet and txHash required');
     if (!/^0x[a-fA-F0-9]{40}$/.test(buyerWallet)) return safeError(res, 400, 'Invalid wallet address');
     if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) return safeError(res, 400, 'Invalid transaction hash');
-
     const verification = await verifyTransaction(txHash, buyerWallet);
     if (!verification.valid) {
       await auditLog('INVALID_PURCHASE_TX', buyerWallet, { txHash, reason: verification.reason }, 'WARN');
       return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
     }
-
     const suspicious = await transactionMonitor(buyerWallet, 'MARKETPLACE_PURCHASE');
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
-
-    const { data, error } = await supabase.from('marketplace_listings').update({
-      status: 'sold', buyer_wallet: buyerWallet, tx_hash: txHash, sold_at: new Date().toISOString()
-    }).eq('id', id).select().single();
+    const { data, error } = await supabase.from('marketplace_listings').update({ status: 'sold', buyer_wallet: buyerWallet, tx_hash: txHash, sold_at: new Date().toISOString() }).eq('id', id).select().single();
     if (error) return safeError(res, 500, 'Failed to process purchase');
     await auditLog('MARKETPLACE_PURCHASE', buyerWallet, { listingId: id, txHash }, 'INFO');
     res.json(data);
@@ -598,22 +620,14 @@ v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
     const { walletAddress, stakeTxHash } = sanitize(req.body);
     if (!walletAddress) return safeError(res, 400, 'walletAddress required');
     if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
-
     if (stakeTxHash) {
       const verification = await verifyTransaction(stakeTxHash, walletAddress);
-      if (!verification.valid) {
-        return safeError(res, 400, `Stake verification failed: ${verification.reason}`);
-      }
+      if (!verification.valid) return safeError(res, 400, `Stake verification failed: ${verification.reason}`);
     }
-
     const { data: mission } = await supabase.from('missions').select('*').eq('id', id).single();
     if (!mission || mission.status !== 'active') return safeError(res, 400, 'Mission not available');
     if (new Date(mission.deadline) < new Date()) return safeError(res, 400, 'Mission deadline passed');
-
-    const { data, error } = await supabase.from('mission_claims').insert({
-      mission_id: id, agent_wallet: walletAddress,
-      stake_tx_hash: stakeTxHash, stake_amount_bnb: mission.stake_required_bnb
-    }).select().single();
+    const { data, error } = await supabase.from('mission_claims').insert({ mission_id: id, agent_wallet: walletAddress, stake_tx_hash: stakeTxHash, stake_amount_bnb: mission.stake_required_bnb }).select().single();
     if (error) return safeError(res, 500, 'Failed to claim mission');
     await auditLog('CLAIM_MISSION', walletAddress, { missionId: id }, 'INFO');
     res.json(data);
@@ -625,11 +639,7 @@ v1.post('/missions/claims/:claimId/submit', authenticateToken, async (req, res) 
     const claimId = sanitize(req.params.claimId);
     const { intel_text, intel_photos, intel_video_url, gps_lat, gps_lng } = sanitize(req.body);
     if (!intel_text) return safeError(res, 400, 'intel_text required');
-    const { data, error } = await supabase.from('mission_claims').update({
-      status: 'submitted', intel_text, intel_photos, intel_video_url,
-      gps_lat, gps_lng, gps_verified: !!(gps_lat && gps_lng),
-      submitted_at: new Date().toISOString()
-    }).eq('id', claimId).select().single();
+    const { data, error } = await supabase.from('mission_claims').update({ status: 'submitted', intel_text, intel_photos, intel_video_url, gps_lat, gps_lng, gps_verified: !!(gps_lat && gps_lng), submitted_at: new Date().toISOString() }).eq('id', claimId).select().single();
     if (error) return safeError(res, 500, 'Failed to submit mission');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -657,6 +667,39 @@ v1.get('/missions/agent/:wallet', authenticateToken, async (req, res) => {
     ]);
     res.json({ profile: profileRes.data, missions: claimsRes.data });
   } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── AI MISSION GENERATOR ─────────────────────────────────
+v1.post('/ai/generate-mission', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const { brand, missionType, city, difficulty } = sanitize(req.body);
+    if (!brand || !missionType || !city) return safeError(res, 400, 'brand, missionType and city required');
+
+    const prompt = `You are the AI agent behind LUXFI, a blockchain platform tokenizing real-world lifestyle brands in Southeast Asia. Generate a dramatic spy-style mission briefing.
+
+Brand: ${brand}
+Mission Type: ${missionType}
+City: ${city}
+Difficulty: ${difficulty || 'ROUTINE'}
+
+Return ONLY a JSON object with no markdown, no backticks:
+{
+  "codename": "OPERATION [DRAMATIC TWO WORD NAME IN CAPS]",
+  "briefing": "3 sentences in spy AI voice. Address the agent directly. Reference the brand and city. Create urgency.",
+  "requirements": ["Requirement 1", "Requirement 2", "Requirement 3", "Requirement 4"]
+}`;
+
+    const result = await callClaudeWithFallback(prompt);
+    const mission = JSON.parse(result);
+    await auditLog('GENERATE_MISSION', 'admin', { brand, city }, 'INFO');
+    res.json(mission);
+  } catch (err) {
+    logger.error({ message: 'Mission generation failed', err: err.message });
+    Sentry.captureException(err);
+    return safeError(res, 500, 'Mission generation failed');
+  }
 });
 
 // ─── ADMIN ────────────────────────────────────────────────
@@ -691,6 +734,27 @@ v1.post('/admin/verify-tx', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── ANOMALY MONITORING ───────────────────────────────────
+v1.get('/admin/anomalies', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+
+    const [highSeverity, recentLogins, suspiciousActivity] = await Promise.all([
+      supabase.from('audit_logs').select('*').eq('severity', 'HIGH').order('created_at', { ascending: false }).limit(20),
+      supabase.from('audit_logs').select('*').eq('action', 'FAILED_LOGIN').gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()),
+      supabase.from('suspicious_activity').select('*').eq('resolved', false).order('created_at', { ascending: false }).limit(20)
+    ]);
+
+    res.json({
+      highSeverityEvents: highSeverity.data || [],
+      failedLoginsLast24h: recentLogins.data?.length || 0,
+      unresolvedSuspicious: suspiciousActivity.data || [],
+      generatedAt: new Date().toISOString()
+    });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
 // ─── SCHEDULED JOBS ───────────────────────────────────────
 cron.schedule('*/30 * * * *', async () => {
   try {
@@ -698,6 +762,17 @@ cron.schedule('*/30 * * * *', async () => {
     logger.info({ message: 'Expired nonces cleaned up' });
   } catch (err) {
     logger.error({ message: 'Nonce cleanup failed', err: err.message });
+    Sentry.captureException(err);
+  }
+});
+
+// Update time-weighted scores every hour
+cron.schedule('0 * * * *', async () => {
+  try {
+    await supabase.rpc('update_all_time_weighted_scores');
+    logger.info({ message: 'Time-weighted scores updated' });
+  } catch (err) {
+    logger.error({ message: 'Score update failed', err: err.message });
     Sentry.captureException(err);
   }
 });
@@ -715,3 +790,10 @@ app.use((err, req, res, next) => {
 // ─── START ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
+```
+
+Delete old code → paste → **Commit changes** ✅
+
+Also add to Railway Variables:
+```
+ANTHROPIC_API_KEY = your-anthropic-api-key
