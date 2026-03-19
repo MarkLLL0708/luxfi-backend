@@ -81,16 +81,14 @@ const getBSCProvider = async (maxRetries = 3) => {
         return provider;
       } catch (err) {
         logger.warn({ message: `RPC attempt ${attempt}/${maxRetries} failed`, rpc, err: err.message });
-        if (attempt < maxRetries) {
-          await sleep(Math.pow(2, attempt - 1) * 1000);
-        }
+        if (attempt < maxRetries) await sleep(Math.pow(2, attempt - 1) * 1000);
       }
     }
   }
   throw new Error('All RPC providers failed after retries');
 };
 
-// ─── MARKET DATA — FREE SOURCES ───────────────────────────
+// ─── MARKET DATA ─────────────────────────────────────────
 const marketDataCache = new Map();
 const MARKET_CACHE_TTL = 5 * 60 * 1000;
 
@@ -119,7 +117,6 @@ const getBNBPrice = async () => {
     }
   }
 
-  // Fallback to Binance
   try {
     const backup = await axios.get('https://api.binance.com/api/v3/ticker/24hr?symbol=BNBUSDT', { timeout: 5000 });
     const data = {
@@ -145,13 +142,6 @@ const getBrandMarketData = async (brandName, city) => {
       `You are a market analyst for LUXFI platform. Provide a brief market intelligence report for:
 Brand: ${brandName}
 Location: ${city}
-
-Based on general knowledge about this type of brand in this market, provide:
-1. Market sentiment (bullish/neutral/bearish)
-2. Growth potential (1-10)
-3. Risk level (low/medium/high)
-4. Key market factors (2-3 bullet points)
-
 Respond ONLY in JSON:
 {
   "sentiment": "bullish|neutral|bearish",
@@ -194,11 +184,28 @@ const checkJurisdiction = async (req, res, next) => {
 // ─── SECURITY MIDDLEWARE ──────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: true, crossOriginEmbedderPolicy: true }));
 
-const allowedOrigins = process.env.NODE_ENV === 'production'
-  ? ['https://luxfivault.netlify.app']
-  : ['https://luxfivault.netlify.app', 'http://localhost:5173'];
+const allowedOrigins = [
+  'https://luxfivault.netlify.app',
+  'http://localhost:5173',
+  'https://lovable.app',
+  'https://gptengineer.app',
+  /https:\/\/.*\.lovable\.app$/,
+  /https:\/\/.*\.lovableproject\.com$/,
+  /https:\/\/.*\.gptengineer\.app$/
+];
 
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    const allowed = allowedOrigins.some(o =>
+      typeof o === 'string' ? o === origin : o.test(origin)
+    );
+    if (allowed) return callback(null, true);
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+}));
+
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 app.use(mongoSanitize());
@@ -242,7 +249,6 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_TOKENS_LIMIT = 1000;
 
 const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
-  // Enforce response length limit
   const limitedTokens = Math.min(maxTokens, MAX_TOKENS_LIMIT);
   const cacheKey = crypto.createHash('md5').update(prompt).digest('hex');
   const cached = claudeCache.get(cacheKey);
@@ -298,7 +304,7 @@ const validateAndConsumeNonce = async (nonce, walletAddress) => {
   return true;
 };
 
-// ─── ON-CHAIN TRANSACTION VERIFICATION + RETRY ───────────
+// ─── ON-CHAIN TRANSACTION VERIFICATION ───────────────────
 const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3, maxRetries = 3) => {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -315,11 +321,8 @@ const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3, max
       return { valid: true, confirmations, blockNumber: receipt.blockNumber };
     } catch (err) {
       logger.error({ message: `Transaction verification attempt ${attempt} failed`, err: err.message });
-      if (attempt < maxRetries) {
-        await sleep(Math.pow(2, attempt - 1) * 1000);
-      } else {
-        return { valid: false, reason: 'Verification service unavailable after retries' };
-      }
+      if (attempt < maxRetries) await sleep(Math.pow(2, attempt - 1) * 1000);
+      else return { valid: false, reason: 'Verification service unavailable after retries' };
     }
   }
   return { valid: false, reason: 'Verification failed' };
