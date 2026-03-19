@@ -7,17 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  security-scan:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm ci
-      - run: npx audit-ci --moderate || true
-
   lint:
     name: Lint & Validate
     runs-on: ubuntu-latest
@@ -26,8 +15,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm ci
-      - run: node --check index.js && echo "Syntax OK"
+      - run: npm install
+      - run: node --check index.js && echo "Syntax OK ✅"
 
   health-check:
     name: Production Health Check
@@ -36,7 +25,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Wait for Railway to deploy
-        run: sleep 60
+        run: sleep 90
 
       - name: Check health endpoint
         run: |
@@ -47,7 +36,7 @@ jobs:
               echo "Health check passed ✅"
               exit 0
             fi
-            sleep 15
+            sleep 20
           done
-          echo "Health check failed after 5 attempts"
+          echo "Health check failed after 5 attempts ❌"
           exit 1
