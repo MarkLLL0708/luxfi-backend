@@ -286,22 +286,37 @@ const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
   throw new Error('All Claude API attempts failed');
 };
 
-// ─── NONCE MANAGEMENT ─────────────────────────────────────
+// ─── NONCE MANAGEMENT (Fix 5 — store timestamp with nonce) ─
 const generateNonce = async (walletAddress) => {
   const nonce = crypto.randomBytes(32).toString('hex');
+  const timestamp = Date.now(); // Fix 5: store exact timestamp
+  const message = `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${timestamp}`;
+
   const { error } = await supabase.from('auth_nonces').insert({
-    nonce, wallet_address: walletAddress,
+    nonce,
+    wallet_address: walletAddress,
+    timestamp, // stored so login can use exact same timestamp
+    message,   // store exact message too
     expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString()
   });
   if (error) throw new Error('Failed to generate nonce');
-  return nonce;
+  return { nonce, timestamp, message };
 };
 
 const validateAndConsumeNonce = async (nonce, walletAddress) => {
-  const { data, error } = await supabase.from('auth_nonces').select('*').eq('nonce', nonce).eq('wallet_address', walletAddress).eq('is_used', false).gt('expires_at', new Date().toISOString()).single();
-  if (error || !data) return false;
-  await supabase.from('auth_nonces').update({ is_used: true, used_at: new Date().toISOString() }).eq('id', data.id);
-  return true;
+  const { data, error } = await supabase
+    .from('auth_nonces')
+    .select('*')
+    .eq('nonce', nonce)
+    .eq('wallet_address', walletAddress)
+    .eq('is_used', false)
+    .gt('expires_at', new Date().toISOString())
+    .single();
+  if (error || !data) return null;
+  await supabase.from('auth_nonces')
+    .update({ is_used: true, used_at: new Date().toISOString() })
+    .eq('id', data.id);
+  return data; // return full record including stored message
 };
 
 // ─── ON-CHAIN TRANSACTION VERIFICATION ───────────────────
@@ -328,14 +343,25 @@ const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3, max
   return { valid: false, reason: 'Verification failed' };
 };
 
-// ─── TRANSACTION MONITORING ───────────────────────────────
+// ─── TRANSACTION MONITORING (Fix 7 — nullable count) ─────
 const transactionMonitor = async (walletAddress, action) => {
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const { count } = await supabase.from('transactions').select('*', { count: 'exact', head: true }).eq('user_wallet', walletAddress).gte('created_at', oneHourAgo);
-    if (count > 50) {
+    const { count } = await supabase
+      .from('transactions')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_wallet', walletAddress)
+      .gte('created_at', oneHourAgo);
+
+    // Fix 7: use nullish coalescing to handle null count
+    if ((count ?? 0) > 50) {
       logger.warn({ message: 'Suspicious activity', walletAddress, action, count });
-      await supabase.from('audit_logs').insert({ wallet_address: walletAddress, action: 'SUSPICIOUS_ACTIVITY', details: { count, action }, severity: 'HIGH' });
+      await supabase.from('audit_logs').insert({
+        wallet_address: walletAddress,
+        action: 'SUSPICIOUS_ACTIVITY',
+        details: { count, action },
+        severity: 'HIGH'
+      });
       return true;
     }
     return false;
@@ -345,7 +371,11 @@ const transactionMonitor = async (walletAddress, action) => {
 // ─── AUDIT LOG ────────────────────────────────────────────
 const auditLog = async (action, walletAddress, details, severity = 'INFO') => {
   try {
-    await supabase.from('audit_logs').insert({ action, wallet_address: walletAddress, details: JSON.stringify(details), severity, created_at: new Date().toISOString() });
+    await supabase.from('audit_logs').insert({
+      action, wallet_address: walletAddress,
+      details: JSON.stringify(details), severity,
+      created_at: new Date().toISOString()
+    });
   } catch (err) {
     logger.error({ message: 'Audit log failed', err: err.message });
   }
@@ -395,9 +425,7 @@ v1.get('/market/bnb-price', async (req, res) => {
   try {
     const data = await getBNBPrice();
     res.json(data);
-  } catch (err) {
-    return safeError(res, 500, 'Failed to fetch BNB price');
-  }
+  } catch { return safeError(res, 500, 'Failed to fetch BNB price'); }
 });
 
 v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
@@ -407,19 +435,17 @@ v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
     if (!brand) return safeError(res, 404, 'Brand not found');
     const marketData = await getBrandMarketData(brand.name, brand.city);
     res.json({ brand: brand.name, city: brand.city, ...marketData });
-  } catch (err) {
-    return safeError(res, 500, 'Failed to fetch brand market data');
-  }
+  } catch { return safeError(res, 500, 'Failed to fetch brand market data'); }
 });
 
-// ─── AUTH ─────────────────────────────────────────────────
+// ─── AUTH (Fix 5 — use stored message for verification) ───
 v1.post('/auth/nonce', authLimiter, async (req, res) => {
   const { walletAddress } = sanitize(req.body);
   if (!walletAddress) return safeError(res, 400, 'walletAddress required');
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
   try {
-    const nonce = await generateNonce(walletAddress);
-    res.json({ nonce, message: `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${Date.now()}` });
+    const { nonce, timestamp, message } = await generateNonce(walletAddress);
+    res.json({ nonce, timestamp, message }); // return exact message to sign
   } catch {
     return safeError(res, 500, 'Failed to generate nonce');
   }
@@ -429,12 +455,17 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   const { walletAddress, signature, nonce } = sanitize(req.body);
   if (!signature || !nonce || !walletAddress) return safeError(res, 400, 'walletAddress, signature and nonce required');
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address format');
-  const nonceValid = await validateAndConsumeNonce(nonce, walletAddress);
-  if (!nonceValid) {
+
+  // Fix 5: validate nonce and get stored message
+  const nonceData = await validateAndConsumeNonce(nonce, walletAddress);
+  if (!nonceData) {
     await auditLog('FAILED_LOGIN', walletAddress, { reason: 'Invalid or expired nonce' }, 'WARN');
     return safeError(res, 401, 'Invalid or expired nonce');
   }
-  const message = `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${Date.now()}`;
+
+  // Fix 5: use stored message — not regenerated with new Date.now()
+  const message = nonceData.message;
+
   try {
     const recovered = ethers.verifyMessage(message, signature);
     if (recovered.toLowerCase() !== walletAddress.toLowerCase()) {
@@ -444,6 +475,7 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   } catch {
     return safeError(res, 401, 'Signature verification failed');
   }
+
   try {
     const { data: existing } = await supabase.from('users').select('*').eq('wallet_address', walletAddress).single();
     let user = existing;
