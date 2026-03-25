@@ -947,8 +947,3 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
 ```
 
----
-
-Commit message:
-```
-security: fix CORS wildcard, admin-only brand creation, remove user-supplied voting power
