@@ -61,6 +61,12 @@ const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// ─── FIX C-03: Validate JWT secret strength ───────────────
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  logger.error({ message: 'FATAL: JWT_SECRET must be at least 32 characters' });
+  process.exit(1);
+}
+
 // ─── RETRY HELPER ─────────────────────────────────────────
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -132,16 +138,30 @@ const getBNBPrice = async () => {
   }
 };
 
+// ─── FIX H-03/H-04: Prompt injection sanitizer ───────────
+const sanitizePromptInput = (str) => {
+  if (typeof str !== 'string') return '';
+  return str
+    .replace(/ignore previous instructions/gi, '')
+    .replace(/system prompt/gi, '')
+    .replace(/you are now/gi, '')
+    .replace(/forget everything/gi, '')
+    .substring(0, 200);
+};
+
 const getBrandMarketData = async (brandName, city) => {
   const cacheKey = `brand_${brandName}_${city}`;
   const cached = marketDataCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) return cached.data;
 
   try {
+    // FIX H-03: sanitize before injecting into prompt
+    const safeBrand = sanitizePromptInput(brandName);
+    const safeCity = sanitizePromptInput(city);
     const data = await callClaudeWithFallback(
       `You are a market analyst for LUXFI platform. Provide a brief market intelligence report for:
-Brand: ${brandName}
-Location: ${city}
+Brand: ${safeBrand}
+Location: ${safeCity}
 Respond ONLY in JSON:
 {
   "sentiment": "bullish|neutral|bearish",
@@ -184,11 +204,10 @@ const checkJurisdiction = async (req, res, next) => {
 // ─── SECURITY MIDDLEWARE ──────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: true, crossOriginEmbedderPolicy: true }));
 
-// FIX 1: Restricted CORS to specific domains only
+// FIX C-05: Remove localhost from production CORS
 const allowedOrigins = [
   'https://luxfivault.netlify.app',
   'https://equine-legacy-vault.lovable.app',
-  'http://localhost:5173',
 ];
 
 app.use(cors({
@@ -210,6 +229,13 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many login attempts' }
+});
+
+// FIX C-01: Rate limiter for mission submissions
+const missionSubmitLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many mission submissions' }
 });
 
 // ─── PROMETHEUS MIDDLEWARE ────────────────────────────────
@@ -286,12 +312,8 @@ const generateNonce = async (walletAddress) => {
   const nonce = crypto.randomBytes(32).toString('hex');
   const timestamp = Date.now();
   const message = `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${timestamp}`;
-
   const { error } = await supabase.from('auth_nonces').insert({
-    nonce,
-    wallet_address: walletAddress,
-    timestamp,
-    message,
+    nonce, wallet_address: walletAddress, timestamp, message,
     expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString()
   });
   if (error) throw new Error('Failed to generate nonce');
@@ -347,7 +369,6 @@ const transactionMonitor = async (walletAddress, action) => {
       .select('*', { count: 'exact', head: true })
       .eq('user_wallet', walletAddress)
       .gte('created_at', oneHourAgo);
-
     if ((count ?? 0) > 50) {
       logger.warn({ message: 'Suspicious activity', walletAddress, action, count });
       await supabase.from('audit_logs').insert({
@@ -367,8 +388,8 @@ const auditLog = async (action, walletAddress, details, severity = 'INFO') => {
   try {
     await supabase.from('audit_logs').insert({
       action, wallet_address: walletAddress,
-      details: JSON.stringify(details), severity,
-      created_at: new Date().toISOString()
+      details: JSON.stringify(details).substring(0, 1000),
+      severity, created_at: new Date().toISOString()
     });
   } catch (err) {
     logger.error({ message: 'Audit log failed', err: err.message });
@@ -440,34 +461,26 @@ v1.post('/auth/nonce', authLimiter, async (req, res) => {
   try {
     const { nonce, timestamp, message } = await generateNonce(walletAddress);
     res.json({ nonce, timestamp, message });
-  } catch {
-    return safeError(res, 500, 'Failed to generate nonce');
-  }
+  } catch { return safeError(res, 500, 'Failed to generate nonce'); }
 });
 
 v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   const { walletAddress, signature, nonce } = sanitize(req.body);
   if (!signature || !nonce || !walletAddress) return safeError(res, 400, 'walletAddress, signature and nonce required');
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address format');
-
   const nonceData = await validateAndConsumeNonce(nonce, walletAddress);
   if (!nonceData) {
     await auditLog('FAILED_LOGIN', walletAddress, { reason: 'Invalid or expired nonce' }, 'WARN');
     return safeError(res, 401, 'Invalid or expired nonce');
   }
-
   const message = nonceData.message;
-
   try {
     const recovered = ethers.verifyMessage(message, signature);
     if (recovered.toLowerCase() !== walletAddress.toLowerCase()) {
       await auditLog('FAILED_LOGIN', walletAddress, { reason: 'Invalid signature' }, 'WARN');
       return safeError(res, 401, 'Invalid wallet signature');
     }
-  } catch {
-    return safeError(res, 401, 'Signature verification failed');
-  }
-
+  } catch { return safeError(res, 401, 'Signature verification failed'); }
   try {
     const { data: existing } = await supabase.from('users').select('*').eq('wallet_address', walletAddress).single();
     let user = existing;
@@ -480,9 +493,7 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
     await auditLog('LOGIN', walletAddress, { userId: user.id }, 'INFO');
     activeUsers.inc();
     res.json({ token, user });
-  } catch {
-    return safeError(res, 500, 'Authentication failed');
-  }
+  } catch { return safeError(res, 500, 'Authentication failed'); }
 });
 
 // ─── BRANDS ───────────────────────────────────────────────
@@ -511,7 +522,7 @@ v1.get('/brands/:id', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// FIX 2: Brand creation restricted to admin only
+// FIX C-02 + FIX 2: Admin only, price validation
 v1.post('/brands', authenticateToken, async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -570,7 +581,13 @@ v1.put('/users/:id/kyc', authenticateToken, async (req, res) => {
 // ─── TRANSACTIONS ─────────────────────────────────────────
 v1.get('/transactions', authenticateToken, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('transactions').select('*').order('created_at', { ascending: false }).limit(100);
+    const page = parseInt(req.query.page) || 0;
+    const limit = 50;
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .range(page * limit, (page + 1) * limit - 1);
     if (error) return safeError(res, 500, 'Failed to fetch transactions');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -579,7 +596,7 @@ v1.get('/transactions', authenticateToken, async (req, res) => {
 v1.get('/transactions/brand/:brandId', authenticateToken, async (req, res) => {
   try {
     const brandId = sanitize(req.params.brandId);
-    const { data, error } = await supabase.from('transactions').select('*').eq('brand_id', brandId).order('created_at', { ascending: false });
+    const { data, error } = await supabase.from('transactions').select('*').eq('brand_id', brandId).order('created_at', { ascending: false }).limit(50);
     if (error) return safeError(res, 500, 'Failed to fetch transactions');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -665,7 +682,7 @@ v1.post('/governance', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// FIX 3: Voting power not user-supplied — fixed to 1, derive from chain in v2
+// FIX 3: voting_power not user-supplied
 v1.post('/governance/vote', authenticateToken, async (req, res) => {
   try {
     const { proposalId, userId, option } = sanitize(req.body);
@@ -673,10 +690,7 @@ v1.post('/governance/vote', authenticateToken, async (req, res) => {
     const { data: existing } = await supabase.from('votes').select('id').eq('proposal_id', proposalId).eq('user_id', userId).single();
     if (existing) return safeError(res, 400, 'Already voted on this proposal');
     const { data, error } = await supabase.from('votes').insert({
-      proposal_id: proposalId,
-      user_id: userId,
-      option,
-      voting_power: 1
+      proposal_id: proposalId, user_id: userId, option, voting_power: 1
     }).select().single();
     if (error) return safeError(res, 500, 'Failed to cast vote');
     await auditLog('CAST_VOTE', req.user.walletAddress, { proposalId, option }, 'INFO');
@@ -693,14 +707,17 @@ v1.get('/marketplace', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// FIX C-02: Price validation on marketplace listings
 v1.post('/marketplace', authenticateToken, async (req, res) => {
   try {
     const body = sanitize(req.body);
     if (!body.brand_id || !body.price_bnb) return safeError(res, 400, 'brand_id and price_bnb required');
-    if (body.price_bnb <= 0) return safeError(res, 400, 'Price must be greater than 0');
-    const { data, error } = await supabase.from('marketplace_listings').insert(body).select().single();
+    const price = parseFloat(body.price_bnb);
+    if (isNaN(price) || price <= 0) return safeError(res, 400, 'Price must be a positive number');
+    if (price > 10000) return safeError(res, 400, 'Price exceeds maximum allowed (10000 BNB)');
+    const { data, error } = await supabase.from('marketplace_listings').insert({ ...body, price_bnb: price }).select().single();
     if (error) return safeError(res, 500, 'Failed to create listing');
-    await auditLog('CREATE_LISTING', req.user.walletAddress, { brandId: body.brand_id, price: body.price_bnb }, 'INFO');
+    await auditLog('CREATE_LISTING', req.user.walletAddress, { brandId: body.brand_id, price }, 'INFO');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
@@ -777,12 +794,23 @@ v1.post('/missions', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// FIX C-04: Duplicate claim check
 v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const { walletAddress, stakeTxHash } = sanitize(req.body);
     if (!walletAddress) return safeError(res, 400, 'walletAddress required');
     if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
+
+    // FIX C-04: Check if already claimed
+    const { data: existingClaim } = await supabase
+      .from('mission_claims')
+      .select('id')
+      .eq('mission_id', id)
+      .eq('agent_wallet', walletAddress)
+      .single();
+    if (existingClaim) return safeError(res, 400, 'Already claimed this mission');
+
     if (stakeTxHash) {
       const verification = await verifyTransaction(stakeTxHash, walletAddress);
       if (!verification.valid) return safeError(res, 400, `Stake verification failed: ${verification.reason}`);
@@ -790,19 +818,55 @@ v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
     const { data: mission } = await supabase.from('missions').select('*').eq('id', id).single();
     if (!mission || mission.status !== 'active') return safeError(res, 400, 'Mission not available');
     if (new Date(mission.deadline) < new Date()) return safeError(res, 400, 'Mission deadline passed');
-    const { data, error } = await supabase.from('mission_claims').insert({ mission_id: id, agent_wallet: walletAddress, stake_tx_hash: stakeTxHash, stake_amount_bnb: mission.stake_required_bnb }).select().single();
+    const { data, error } = await supabase.from('mission_claims').insert({
+      mission_id: id, agent_wallet: walletAddress,
+      stake_tx_hash: stakeTxHash, stake_amount_bnb: mission.stake_required_bnb
+    }).select().single();
     if (error) return safeError(res, 500, 'Failed to claim mission');
     await auditLog('CLAIM_MISSION', walletAddress, { missionId: id }, 'INFO');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-v1.post('/missions/claims/:claimId/submit', authenticateToken, async (req, res) => {
+// FIX C-01: Rate limiting + H-01: Input length validation + H-02: GPS validation
+v1.post('/missions/claims/:claimId/submit', authenticateToken, missionSubmitLimiter, async (req, res) => {
   try {
     const claimId = sanitize(req.params.claimId);
     const { intel_text, intel_photos, intel_video_url, gps_lat, gps_lng } = sanitize(req.body);
+
+    // FIX H-01: Input length validation
     if (!intel_text) return safeError(res, 400, 'intel_text required');
-    const { data, error } = await supabase.from('mission_claims').update({ status: 'submitted', intel_text, intel_photos, intel_video_url, gps_lat, gps_lng, gps_verified: !!(gps_lat && gps_lng), submitted_at: new Date().toISOString() }).eq('id', claimId).select().single();
+    if (intel_text.length > 5000) return safeError(res, 400, 'intel_text exceeds maximum length of 5000 characters');
+    if (intel_video_url && intel_video_url.length > 500) return safeError(res, 400, 'Video URL too long');
+
+    // FIX H-02: GPS coordinate validation
+    let gpsVerified = false;
+    let validLat = null;
+    let validLng = null;
+    if (gps_lat !== undefined && gps_lng !== undefined) {
+      const lat = parseFloat(gps_lat);
+      const lng = parseFloat(gps_lng);
+      if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        return safeError(res, 400, 'Invalid GPS coordinates');
+      }
+      validLat = lat;
+      validLng = lng;
+      gpsVerified = true;
+    }
+
+    // FIX M-04: Limit photos array
+    const photos = Array.isArray(intel_photos) ? intel_photos.slice(0, 10) : null;
+
+    const { data, error } = await supabase.from('mission_claims').update({
+      status: 'submitted',
+      intel_text: intel_text.substring(0, 5000),
+      intel_photos: photos,
+      intel_video_url: intel_video_url || null,
+      gps_lat: validLat,
+      gps_lng: validLng,
+      gps_verified: gpsVerified,
+      submitted_at: new Date().toISOString()
+    }).eq('id', claimId).select().single();
     if (error) return safeError(res, 500, 'Failed to submit mission');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -832,27 +896,34 @@ v1.get('/missions/agent/:wallet', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── AI MISSION GENERATOR ─────────────────────────────────
+// FIX H-04: Prompt injection protection on mission generator
 v1.post('/ai/generate-mission', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
     const { brand, missionType, city, difficulty } = sanitize(req.body);
     if (!brand || !missionType || !city) return safeError(res, 400, 'brand, missionType and city required');
+
+    // FIX H-04: Sanitize all prompt inputs
+    const safeBrand = sanitizePromptInput(brand);
+    const safeMissionType = sanitizePromptInput(missionType);
+    const safeCity = sanitizePromptInput(city);
+    const safeDifficulty = sanitizePromptInput(difficulty || 'ROUTINE');
+
     const prompt = `You are the AI agent behind LUXFI, a blockchain platform tokenizing real-world lifestyle brands in Southeast Asia. Generate a dramatic spy-style mission briefing.
-Brand: ${brand}
-Mission Type: ${missionType}
-City: ${city}
-Difficulty: ${difficulty || 'ROUTINE'}
+Brand: ${safeBrand}
+Mission Type: ${safeMissionType}
+City: ${safeCity}
+Difficulty: ${safeDifficulty}
 Return ONLY a JSON object with no markdown, no backticks:
 {
   "codename": "OPERATION [DRAMATIC TWO WORD NAME IN CAPS]",
-  "briefing": "3 sentences in spy AI voice. Address the agent directly. Reference the brand and city. Create urgency.",
+  "briefing": "3 sentences in spy AI voice.",
   "requirements": ["Requirement 1", "Requirement 2", "Requirement 3", "Requirement 4"]
 }`;
     const result = await callClaudeWithFallback(prompt);
     const mission = JSON.parse(result);
-    await auditLog('GENERATE_MISSION', 'admin', { brand, city }, 'INFO');
+    await auditLog('GENERATE_MISSION', 'admin', { brand: safeBrand, city: safeCity }, 'INFO');
     res.json(mission);
   } catch (err) {
     logger.error({ message: 'Mission generation failed', err: err.message });
@@ -945,5 +1016,3 @@ app.use((err, req, res, next) => {
 // ─── START ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
-
-
