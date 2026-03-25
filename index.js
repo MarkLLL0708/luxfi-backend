@@ -184,22 +184,17 @@ const checkJurisdiction = async (req, res, next) => {
 // ─── SECURITY MIDDLEWARE ──────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: true, crossOriginEmbedderPolicy: true }));
 
+// FIX 1: Restricted CORS to specific domains only
 const allowedOrigins = [
   'https://luxfivault.netlify.app',
+  'https://equine-legacy-vault.lovable.app',
   'http://localhost:5173',
-  'https://lovable.app',
-  'https://gptengineer.app',
-  /https:\/\/.*\.lovable\.app$/,
-  /https:\/\/.*\.lovableproject\.com$/,
-  /https:\/\/.*\.gptengineer\.app$/
 ];
 
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
-    const allowed = allowedOrigins.some(o =>
-      typeof o === 'string' ? o === origin : o.test(origin)
-    );
+    const allowed = allowedOrigins.includes(origin);
     if (allowed) return callback(null, true);
     callback(new Error('Not allowed by CORS'));
   },
@@ -286,17 +281,17 @@ const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
   throw new Error('All Claude API attempts failed');
 };
 
-// ─── NONCE MANAGEMENT (Fix 5 — store timestamp with nonce) ─
+// ─── NONCE MANAGEMENT ─────────────────────────────────────
 const generateNonce = async (walletAddress) => {
   const nonce = crypto.randomBytes(32).toString('hex');
-  const timestamp = Date.now(); // Fix 5: store exact timestamp
+  const timestamp = Date.now();
   const message = `Sign this message to login to LUXFI.\n\nNonce: ${nonce}\nTimestamp: ${timestamp}`;
 
   const { error } = await supabase.from('auth_nonces').insert({
     nonce,
     wallet_address: walletAddress,
-    timestamp, // stored so login can use exact same timestamp
-    message,   // store exact message too
+    timestamp,
+    message,
     expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString()
   });
   if (error) throw new Error('Failed to generate nonce');
@@ -316,7 +311,7 @@ const validateAndConsumeNonce = async (nonce, walletAddress) => {
   await supabase.from('auth_nonces')
     .update({ is_used: true, used_at: new Date().toISOString() })
     .eq('id', data.id);
-  return data; // return full record including stored message
+  return data;
 };
 
 // ─── ON-CHAIN TRANSACTION VERIFICATION ───────────────────
@@ -343,7 +338,7 @@ const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3, max
   return { valid: false, reason: 'Verification failed' };
 };
 
-// ─── TRANSACTION MONITORING (Fix 7 — nullable count) ─────
+// ─── TRANSACTION MONITORING ───────────────────────────────
 const transactionMonitor = async (walletAddress, action) => {
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
@@ -353,7 +348,6 @@ const transactionMonitor = async (walletAddress, action) => {
       .eq('user_wallet', walletAddress)
       .gte('created_at', oneHourAgo);
 
-    // Fix 7: use nullish coalescing to handle null count
     if ((count ?? 0) > 50) {
       logger.warn({ message: 'Suspicious activity', walletAddress, action, count });
       await supabase.from('audit_logs').insert({
@@ -438,14 +432,14 @@ v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
   } catch { return safeError(res, 500, 'Failed to fetch brand market data'); }
 });
 
-// ─── AUTH (Fix 5 — use stored message for verification) ───
+// ─── AUTH ─────────────────────────────────────────────────
 v1.post('/auth/nonce', authLimiter, async (req, res) => {
   const { walletAddress } = sanitize(req.body);
   if (!walletAddress) return safeError(res, 400, 'walletAddress required');
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
   try {
     const { nonce, timestamp, message } = await generateNonce(walletAddress);
-    res.json({ nonce, timestamp, message }); // return exact message to sign
+    res.json({ nonce, timestamp, message });
   } catch {
     return safeError(res, 500, 'Failed to generate nonce');
   }
@@ -456,14 +450,12 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   if (!signature || !nonce || !walletAddress) return safeError(res, 400, 'walletAddress, signature and nonce required');
   if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address format');
 
-  // Fix 5: validate nonce and get stored message
   const nonceData = await validateAndConsumeNonce(nonce, walletAddress);
   if (!nonceData) {
     await auditLog('FAILED_LOGIN', walletAddress, { reason: 'Invalid or expired nonce' }, 'WARN');
     return safeError(res, 401, 'Invalid or expired nonce');
   }
 
-  // Fix 5: use stored message — not regenerated with new Date.now()
   const message = nonceData.message;
 
   try {
@@ -519,8 +511,12 @@ v1.get('/brands/:id', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// FIX 2: Brand creation restricted to admin only
 v1.post('/brands', authenticateToken, async (req, res) => {
   try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY)
+      return safeError(res, 403, 'Admin access required');
     const body = sanitize(req.body);
     if (!body.name) return safeError(res, 400, 'name required');
     const { data, error } = await supabase.from('brands').insert(body).select().single();
@@ -532,6 +528,9 @@ v1.post('/brands', authenticateToken, async (req, res) => {
 
 v1.put('/brands/:id', authenticateToken, async (req, res) => {
   try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY)
+      return safeError(res, 403, 'Admin access required');
     const id = sanitize(req.params.id);
     const body = sanitize(req.body);
     const { data, error } = await supabase.from('brands').update(body).eq('id', id).select().single();
@@ -554,6 +553,9 @@ v1.get('/users/:wallet', authenticateToken, async (req, res) => {
 
 v1.put('/users/:id/kyc', authenticateToken, async (req, res) => {
   try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY)
+      return safeError(res, 403, 'Admin access required');
     const id = sanitize(req.params.id);
     const { status } = sanitize(req.body);
     const validStatuses = ['pending', 'approved', 'rejected'];
@@ -663,13 +665,19 @@ v1.post('/governance', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// FIX 3: Voting power not user-supplied — fixed to 1, derive from chain in v2
 v1.post('/governance/vote', authenticateToken, async (req, res) => {
   try {
-    const { proposalId, userId, option, votingPower } = sanitize(req.body);
+    const { proposalId, userId, option } = sanitize(req.body);
     if (!proposalId || !userId || !option) return safeError(res, 400, 'proposalId, userId and option required');
     const { data: existing } = await supabase.from('votes').select('id').eq('proposal_id', proposalId).eq('user_id', userId).single();
     if (existing) return safeError(res, 400, 'Already voted on this proposal');
-    const { data, error } = await supabase.from('votes').insert({ proposal_id: proposalId, user_id: userId, option, voting_power: votingPower || 1 }).select().single();
+    const { data, error } = await supabase.from('votes').insert({
+      proposal_id: proposalId,
+      user_id: userId,
+      option,
+      voting_power: 1
+    }).select().single();
     if (error) return safeError(res, 500, 'Failed to cast vote');
     await auditLog('CAST_VOTE', req.user.walletAddress, { proposalId, option }, 'INFO');
     res.json(data);
@@ -937,3 +945,10 @@ app.use((err, req, res, next) => {
 // ─── START ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
+```
+
+---
+
+Commit message:
+```
+security: fix CORS wildcard, admin-only brand creation, remove user-supplied voting power
