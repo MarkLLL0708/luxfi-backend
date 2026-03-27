@@ -155,7 +155,6 @@ const getBrandMarketData = async (brandName, city) => {
   if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) return cached.data;
 
   try {
-    // FIX H-03: sanitize before injecting into prompt
     const safeBrand = sanitizePromptInput(brandName);
     const safeCity = sanitizePromptInput(city);
     const data = await callClaudeWithFallback(
@@ -204,7 +203,6 @@ const checkJurisdiction = async (req, res, next) => {
 // ─── SECURITY MIDDLEWARE ──────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: true, crossOriginEmbedderPolicy: true }));
 
-// FIX C-05: Remove localhost from production CORS
 const allowedOrigins = [
   'https://luxfivault.netlify.app',
   'https://equine-legacy-vault.lovable.app',
@@ -231,11 +229,16 @@ const authLimiter = rateLimit({
   message: { error: 'Too many login attempts' }
 });
 
-// FIX C-01: Rate limiter for mission submissions
 const missionSubmitLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 5,
   message: { error: 'Too many mission submissions' }
+});
+
+const missionVerifyLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many verification requests' }
 });
 
 // ─── PROMETHEUS MIDDLEWARE ────────────────────────────────
@@ -522,7 +525,6 @@ v1.get('/brands/:id', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// FIX C-02 + FIX 2: Admin only, price validation
 v1.post('/brands', authenticateToken, async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -682,7 +684,6 @@ v1.post('/governance', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// FIX 3: voting_power not user-supplied
 v1.post('/governance/vote', authenticateToken, async (req, res) => {
   try {
     const { proposalId, userId, option } = sanitize(req.body);
@@ -707,7 +708,6 @@ v1.get('/marketplace', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// FIX C-02: Price validation on marketplace listings
 v1.post('/marketplace', authenticateToken, async (req, res) => {
   try {
     const body = sanitize(req.body);
@@ -794,15 +794,12 @@ v1.post('/missions', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// FIX C-04: Duplicate claim check
 v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
   try {
     const id = sanitize(req.params.id);
     const { walletAddress, stakeTxHash } = sanitize(req.body);
     if (!walletAddress) return safeError(res, 400, 'walletAddress required');
     if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
-
-    // FIX C-04: Check if already claimed
     const { data: existingClaim } = await supabase
       .from('mission_claims')
       .select('id')
@@ -810,7 +807,6 @@ v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
       .eq('agent_wallet', walletAddress)
       .single();
     if (existingClaim) return safeError(res, 400, 'Already claimed this mission');
-
     if (stakeTxHash) {
       const verification = await verifyTransaction(stakeTxHash, walletAddress);
       if (!verification.valid) return safeError(res, 400, `Stake verification failed: ${verification.reason}`);
@@ -828,18 +824,13 @@ v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// FIX C-01: Rate limiting + H-01: Input length validation + H-02: GPS validation
 v1.post('/missions/claims/:claimId/submit', authenticateToken, missionSubmitLimiter, async (req, res) => {
   try {
     const claimId = sanitize(req.params.claimId);
     const { intel_text, intel_photos, intel_video_url, gps_lat, gps_lng } = sanitize(req.body);
-
-    // FIX H-01: Input length validation
     if (!intel_text) return safeError(res, 400, 'intel_text required');
     if (intel_text.length > 5000) return safeError(res, 400, 'intel_text exceeds maximum length of 5000 characters');
     if (intel_video_url && intel_video_url.length > 500) return safeError(res, 400, 'Video URL too long');
-
-    // FIX H-02: GPS coordinate validation
     let gpsVerified = false;
     let validLat = null;
     let validLng = null;
@@ -853,10 +844,7 @@ v1.post('/missions/claims/:claimId/submit', authenticateToken, missionSubmitLimi
       validLng = lng;
       gpsVerified = true;
     }
-
-    // FIX M-04: Limit photos array
     const photos = Array.isArray(intel_photos) ? intel_photos.slice(0, 10) : null;
-
     const { data, error } = await supabase.from('mission_claims').update({
       status: 'submitted',
       intel_text: intel_text.substring(0, 5000),
@@ -870,6 +858,131 @@ v1.post('/missions/claims/:claimId/submit', authenticateToken, missionSubmitLimi
     if (error) return safeError(res, 500, 'Failed to submit mission');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── AI MISSION VERIFICATION ──────────────────────────────
+v1.post('/missions/claims/:claimId/ai-verify', authenticateToken, missionVerifyLimiter, async (req, res) => {
+  try {
+    const claimId = sanitize(req.params.claimId);
+    if (!claimId) return safeError(res, 400, 'claimId required');
+
+    const { data: claim, error: claimError } = await supabase
+      .from('mission_claims')
+      .select('*, missions(*)')
+      .eq('id', claimId)
+      .single();
+
+    if (claimError || !claim) return safeError(res, 404, 'Claim not found');
+    if (claim.status !== 'submitted') return safeError(res, 400, 'Claim not in submitted state');
+    if (!claim.intel_text) return safeError(res, 400, 'No intel submitted');
+
+    await supabase
+      .from('mission_claims')
+      .update({ status: 'ai_reviewing' })
+      .eq('id', claimId);
+
+    const mission = claim.missions;
+    const prompt = `You are ARIA, the AI verification system for LUXFI — a Web 4.0 RWA tokenization platform in Southeast Asia.
+
+Your job is to verify mission intel submitted by field agents.
+
+MISSION DETAILS:
+- Codename: ${sanitizePromptInput(mission?.codename || 'Unknown')}
+- Brand: ${sanitizePromptInput(mission?.brand_name || 'Unknown')}
+- City: ${sanitizePromptInput(mission?.city || 'Unknown')}
+- Mission Type: ${sanitizePromptInput(mission?.mission_type || 'Unknown')}
+- Difficulty: ${mission?.difficulty || 1}
+- Requirements: ${sanitizePromptInput(JSON.stringify(mission?.requirements || []))}
+
+AGENT INTEL SUBMITTED:
+${sanitizePromptInput(claim.intel_text.substring(0, 3000))}
+
+GPS VERIFIED: ${claim.gps_verified ? 'YES' : 'NO'}
+PHOTOS SUBMITTED: ${claim.intel_photos ? claim.intel_photos.length : 0}
+
+Evaluate this intel submission and respond ONLY with a JSON object:
+{
+  "score": 85,
+  "approved": true,
+  "reason": "Clear and detailed intel with GPS verification",
+  "feedback": "Excellent field work. Intel confirms brand presence.",
+  "flags": []
+}
+
+Score 0-100. Approve if score >= 70. Be strict but fair.`;
+
+    const aiResponse = await callClaudeWithFallback(prompt, 500);
+    let verification;
+
+    try {
+      const cleaned = aiResponse.replace(/```json|```/g, '').trim();
+      verification = JSON.parse(cleaned);
+    } catch {
+      verification = {
+        score: 50,
+        approved: false,
+        reason: 'AI parsing error — manual review required',
+        feedback: 'System error during verification',
+        flags: ['PARSE_ERROR']
+      };
+    }
+
+    const score = Math.min(100, Math.max(0, parseInt(verification.score) || 0));
+    const approved = score >= 70 && verification.approved === true;
+    const newStatus = approved ? 'approved' : 'rejected';
+
+    await supabase
+      .from('mission_claims')
+      .update({
+        status: newStatus,
+        ai_score: score,
+        ai_verified: true,
+        ai_feedback: verification.feedback,
+      })
+      .eq('id', claimId);
+
+    if (approved) {
+      const difficulty = mission?.difficulty || 1;
+      const rewardMap = {
+        1: { luxfi: 100, bnb: 0.001, badge: 'Bronze' },
+        2: { luxfi: 500, bnb: 0.005, badge: 'Gold' },
+        3: { luxfi: 2500, bnb: 0.025, badge: 'Diamond' }
+      };
+      const reward = rewardMap[difficulty] || rewardMap[1];
+      await supabase
+        .from('mission_claims')
+        .update({
+          luxfi_reward_amount: reward.luxfi,
+          bnb_reward_amount: reward.bnb,
+          nft_badge_tier: difficulty,
+          reward_status: 'pending_distribution'
+        })
+        .eq('id', claimId);
+      await auditLog('MISSION_AI_APPROVED', claim.agent_wallet, { claimId, score, reward, missionId: claim.mission_id }, 'INFO');
+    } else {
+      await auditLog('MISSION_AI_REJECTED', claim.agent_wallet, { claimId, score, reason: verification.reason, flags: verification.flags }, 'WARN');
+    }
+
+    const diffIdx = Math.min((mission?.difficulty || 1) - 1, 2);
+    res.json({
+      claimId,
+      score,
+      approved,
+      status: newStatus,
+      feedback: verification.feedback,
+      reason: verification.reason,
+      reward: approved ? {
+        luxfi: `${[100, 500, 2500][diffIdx]} LUXFI`,
+        bnb: `${[0.001, 0.005, 0.025][diffIdx]} BNB`,
+        badge: ['Bronze', 'Gold', 'Diamond'][diffIdx]
+      } : null
+    });
+
+  } catch (err) {
+    logger.error({ message: 'AI verification failed', err: err.message });
+    Sentry.captureException(err);
+    return safeError(res, 500, 'AI verification failed');
+  }
 });
 
 v1.post('/missions/claims/:claimId/approve', async (req, res) => {
@@ -896,20 +1009,17 @@ v1.get('/missions/agent/:wallet', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// FIX H-04: Prompt injection protection on mission generator
+// ─── AI MISSION GENERATOR ─────────────────────────────────
 v1.post('/ai/generate-mission', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
     const { brand, missionType, city, difficulty } = sanitize(req.body);
     if (!brand || !missionType || !city) return safeError(res, 400, 'brand, missionType and city required');
-
-    // FIX H-04: Sanitize all prompt inputs
     const safeBrand = sanitizePromptInput(brand);
     const safeMissionType = sanitizePromptInput(missionType);
     const safeCity = sanitizePromptInput(city);
     const safeDifficulty = sanitizePromptInput(difficulty || 'ROUTINE');
-
     const prompt = `You are the AI agent behind LUXFI, a blockchain platform tokenizing real-world lifestyle brands in Southeast Asia. Generate a dramatic spy-style mission briefing.
 Brand: ${safeBrand}
 Mission Type: ${safeMissionType}
