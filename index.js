@@ -13,14 +13,12 @@ const axios = require('axios');
 const crypto = require('crypto');
 const promClient = require('prom-client');
 
-// ─── SENTRY ───────────────────────────────────────────────
 Sentry.init({
   dsn: process.env.SENTRY_DSN,
   environment: process.env.NODE_ENV || 'production',
   tracesSampleRate: 1.0,
 });
 
-// ─── PROMETHEUS METRICS ───────────────────────────────────
 const collectDefaultMetrics = promClient.collectDefaultMetrics;
 collectDefaultMetrics();
 
@@ -47,13 +45,9 @@ const transactionCounter = new promClient.Counter({
   labelNames: ['type', 'status']
 });
 
-// ─── LOGGER ───────────────────────────────────────────────
 const logger = winston.createLogger({
   level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
+  format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
   transports: [new winston.transports.Console()]
 });
 
@@ -61,16 +55,13 @@ const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// ─── FIX C-03: Validate JWT secret strength ───────────────
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
   logger.error({ message: 'FATAL: JWT_SECRET must be at least 32 characters' });
   process.exit(1);
 }
 
-// ─── RETRY HELPER ─────────────────────────────────────────
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// ─── BSC RPC MULTI-PROVIDER + RETRY ──────────────────────
 const BSC_RPC_PROVIDERS = [
   process.env.BSC_RPC_URL || 'https://bsc-dataseed1.binance.org',
   'https://bsc-dataseed2.binance.org',
@@ -94,7 +85,6 @@ const getBSCProvider = async (maxRetries = 3) => {
   throw new Error('All RPC providers failed after retries');
 };
 
-// ─── MARKET DATA ─────────────────────────────────────────
 const marketDataCache = new Map();
 const MARKET_CACHE_TTL = 5 * 60 * 1000;
 
@@ -102,7 +92,6 @@ const getBNBPrice = async () => {
   const cacheKey = 'bnb_price';
   const cached = marketDataCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) return cached.data;
-
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const response = await axios.get(
@@ -122,7 +111,6 @@ const getBNBPrice = async () => {
       if (attempt < 3) await sleep(Math.pow(2, attempt - 1) * 1000);
     }
   }
-
   try {
     const backup = await axios.get('https://api.binance.com/api/v3/ticker/24hr?symbol=BNBUSDT', { timeout: 5000 });
     const data = {
@@ -138,7 +126,6 @@ const getBNBPrice = async () => {
   }
 };
 
-// ─── FIX H-03/H-04: Prompt injection sanitizer ───────────
 const sanitizePromptInput = (str) => {
   if (typeof str !== 'string') return '';
   return str
@@ -153,7 +140,6 @@ const getBrandMarketData = async (brandName, city) => {
   const cacheKey = `brand_${brandName}_${city}`;
   const cached = marketDataCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) return cached.data;
-
   try {
     const safeBrand = sanitizePromptInput(brandName);
     const safeCity = sanitizePromptInput(city);
@@ -185,7 +171,6 @@ Respond ONLY in JSON:
   }
 };
 
-// ─── JURISDICTION BLOCKING ────────────────────────────────
 const BLOCKED_COUNTRIES = ['US', 'IR', 'KP', 'CU', 'SY'];
 
 const checkJurisdiction = async (req, res, next) => {
@@ -200,7 +185,6 @@ const checkJurisdiction = async (req, res, next) => {
   } catch { next(); }
 };
 
-// ─── SECURITY MIDDLEWARE ──────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: true, crossOriginEmbedderPolicy: true }));
 
 const allowedOrigins = [
@@ -223,25 +207,10 @@ app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 app.use(mongoSanitize());
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { error: 'Too many requests' } }));
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { error: 'Too many login attempts' }
-});
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Too many login attempts' } });
+const missionSubmitLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many mission submissions' } });
+const missionVerifyLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 20, message: { error: 'Too many verification requests' } });
 
-const missionSubmitLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 5,
-  message: { error: 'Too many mission submissions' }
-});
-
-const missionVerifyLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 20,
-  message: { error: 'Too many verification requests' }
-});
-
-// ─── PROMETHEUS MIDDLEWARE ────────────────────────────────
 app.use((req, res, next) => {
   const end = httpRequestDuration.startTimer({ method: req.method, route: req.path });
   res.on('finish', () => {
@@ -251,7 +220,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── HELPERS ─────────────────────────────────────────────
 const sanitize = (obj) => {
   if (typeof obj === 'string') return xss(obj.trim());
   if (typeof obj === 'object' && obj !== null) {
@@ -267,7 +235,6 @@ const safeError = (res, status, message) => {
 
 const generateRequestId = () => crypto.randomBytes(8).toString('hex').toUpperCase();
 
-// ─── CLAUDE API CACHE + FALLBACK ──────────────────────────
 const claudeCache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_TOKENS_LIMIT = 1000;
@@ -280,9 +247,7 @@ const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
     logger.info({ message: 'Claude API cache hit' });
     return cached.response;
   }
-
   const models = ['claude-sonnet-4-20250514', 'claude-haiku-4-5-20251001'];
-
   for (let attempt = 1; attempt <= 3; attempt++) {
     for (const model of models) {
       try {
@@ -310,7 +275,6 @@ const callClaudeWithFallback = async (prompt, maxTokens = 1000) => {
   throw new Error('All Claude API attempts failed');
 };
 
-// ─── NONCE MANAGEMENT ─────────────────────────────────────
 const generateNonce = async (walletAddress) => {
   const nonce = crypto.randomBytes(32).toString('hex');
   const timestamp = Date.now();
@@ -325,21 +289,14 @@ const generateNonce = async (walletAddress) => {
 
 const validateAndConsumeNonce = async (nonce, walletAddress) => {
   const { data, error } = await supabase
-    .from('auth_nonces')
-    .select('*')
-    .eq('nonce', nonce)
-    .eq('wallet_address', walletAddress)
-    .eq('is_used', false)
-    .gt('expires_at', new Date().toISOString())
-    .single();
+    .from('auth_nonces').select('*')
+    .eq('nonce', nonce).eq('wallet_address', walletAddress)
+    .eq('is_used', false).gt('expires_at', new Date().toISOString()).single();
   if (error || !data) return null;
-  await supabase.from('auth_nonces')
-    .update({ is_used: true, used_at: new Date().toISOString() })
-    .eq('id', data.id);
+  await supabase.from('auth_nonces').update({ is_used: true, used_at: new Date().toISOString() }).eq('id', data.id);
   return data;
 };
 
-// ─── ON-CHAIN TRANSACTION VERIFICATION ───────────────────
 const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3, maxRetries = 3) => {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -363,30 +320,20 @@ const verifyTransaction = async (txHash, expectedFrom, minConfirmations = 3, max
   return { valid: false, reason: 'Verification failed' };
 };
 
-// ─── TRANSACTION MONITORING ───────────────────────────────
 const transactionMonitor = async (walletAddress, action) => {
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const { count } = await supabase
-      .from('transactions')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_wallet', walletAddress)
-      .gte('created_at', oneHourAgo);
+    const { count } = await supabase.from('transactions').select('*', { count: 'exact', head: true })
+      .eq('user_wallet', walletAddress).gte('created_at', oneHourAgo);
     if ((count ?? 0) > 50) {
       logger.warn({ message: 'Suspicious activity', walletAddress, action, count });
-      await supabase.from('audit_logs').insert({
-        wallet_address: walletAddress,
-        action: 'SUSPICIOUS_ACTIVITY',
-        details: { count, action },
-        severity: 'HIGH'
-      });
+      await supabase.from('audit_logs').insert({ wallet_address: walletAddress, action: 'SUSPICIOUS_ACTIVITY', details: { count, action }, severity: 'HIGH' });
       return true;
     }
     return false;
   } catch { return false; }
 };
 
-// ─── AUDIT LOG ────────────────────────────────────────────
 const auditLog = async (action, walletAddress, details, severity = 'INFO') => {
   try {
     await supabase.from('audit_logs').insert({
@@ -394,12 +341,9 @@ const auditLog = async (action, walletAddress, details, severity = 'INFO') => {
       details: JSON.stringify(details).substring(0, 1000),
       severity, created_at: new Date().toISOString()
     });
-  } catch (err) {
-    logger.error({ message: 'Audit log failed', err: err.message });
-  }
+  } catch (err) { logger.error({ message: 'Audit log failed', err: err.message }); }
 };
 
-// ─── REQUEST LOGGER ───────────────────────────────────────
 app.use((req, res, next) => {
   req.requestId = generateRequestId();
   res.setHeader('X-Request-ID', req.requestId);
@@ -407,7 +351,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── JWT MIDDLEWARE ───────────────────────────────────────
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -416,21 +359,16 @@ const authenticateToken = (req, res, next) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
     next();
-  } catch {
-    return safeError(res, 403, 'Invalid or expired token');
-  }
+  } catch { return safeError(res, 403, 'Invalid or expired token'); }
 };
 
-// ─── API VERSIONING ───────────────────────────────────────
 const v1 = express.Router();
 app.use('/api/v1', v1);
 app.use('/api', v1);
 
-// ─── HEALTH ───────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
 v1.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
 
-// ─── PROMETHEUS METRICS ENDPOINT ─────────────────────────
 app.get('/metrics', async (req, res) => {
   const adminKey = req.headers['x-admin-key'];
   if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
@@ -438,12 +376,10 @@ app.get('/metrics', async (req, res) => {
   res.end(await promClient.register.metrics());
 });
 
-// ─── MARKET DATA ENDPOINTS ────────────────────────────────
+// ─── MARKET DATA ─────────────────────────────────────────
 v1.get('/market/bnb-price', async (req, res) => {
-  try {
-    const data = await getBNBPrice();
-    res.json(data);
-  } catch { return safeError(res, 500, 'Failed to fetch BNB price'); }
+  try { res.json(await getBNBPrice()); }
+  catch { return safeError(res, 500, 'Failed to fetch BNB price'); }
 });
 
 v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
@@ -476,9 +412,8 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
     await auditLog('FAILED_LOGIN', walletAddress, { reason: 'Invalid or expired nonce' }, 'WARN');
     return safeError(res, 401, 'Invalid or expired nonce');
   }
-  const message = nonceData.message;
   try {
-    const recovered = ethers.verifyMessage(message, signature);
+    const recovered = ethers.verifyMessage(nonceData.message, signature);
     if (recovered.toLowerCase() !== walletAddress.toLowerCase()) {
       await auditLog('FAILED_LOGIN', walletAddress, { reason: 'Invalid signature' }, 'WARN');
       return safeError(res, 401, 'Invalid wallet signature');
@@ -528,8 +463,7 @@ v1.get('/brands/:id', async (req, res) => {
 v1.post('/brands', authenticateToken, async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
-    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY)
-      return safeError(res, 403, 'Admin access required');
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 403, 'Admin access required');
     const body = sanitize(req.body);
     if (!body.name) return safeError(res, 400, 'name required');
     const { data, error } = await supabase.from('brands').insert(body).select().single();
@@ -542,8 +476,7 @@ v1.post('/brands', authenticateToken, async (req, res) => {
 v1.put('/brands/:id', authenticateToken, async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
-    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY)
-      return safeError(res, 403, 'Admin access required');
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 403, 'Admin access required');
     const id = sanitize(req.params.id);
     const body = sanitize(req.body);
     const { data, error } = await supabase.from('brands').update(body).eq('id', id).select().single();
@@ -567,8 +500,7 @@ v1.get('/users/:wallet', authenticateToken, async (req, res) => {
 v1.put('/users/:id/kyc', authenticateToken, async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
-    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY)
-      return safeError(res, 403, 'Admin access required');
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 403, 'Admin access required');
     const id = sanitize(req.params.id);
     const { status } = sanitize(req.body);
     const validStatuses = ['pending', 'approved', 'rejected'];
@@ -585,11 +517,8 @@ v1.get('/transactions', authenticateToken, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 0;
     const limit = 50;
-    const { data, error } = await supabase
-      .from('transactions')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .range(page * limit, (page + 1) * limit - 1);
+    const { data, error } = await supabase.from('transactions').select('*')
+      .order('created_at', { ascending: false }).range(page * limit, (page + 1) * limit - 1);
     if (error) return safeError(res, 500, 'Failed to fetch transactions');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -598,7 +527,8 @@ v1.get('/transactions', authenticateToken, async (req, res) => {
 v1.get('/transactions/brand/:brandId', authenticateToken, async (req, res) => {
   try {
     const brandId = sanitize(req.params.brandId);
-    const { data, error } = await supabase.from('transactions').select('*').eq('brand_id', brandId).order('created_at', { ascending: false }).limit(50);
+    const { data, error } = await supabase.from('transactions').select('*').eq('brand_id', brandId)
+      .order('created_at', { ascending: false }).limit(50);
     if (error) return safeError(res, 500, 'Failed to fetch transactions');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -649,7 +579,9 @@ v1.post('/rewards/claim', authenticateToken, async (req, res) => {
     if (!poolId || !userId) return safeError(res, 400, 'poolId and userId required');
     const suspicious = await transactionMonitor(req.user.walletAddress, 'CLAIM_REWARD');
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
-    const { data, error } = await supabase.from('reward_claims').update({ status: 'claimed', claimed_at: new Date().toISOString() }).eq('reward_pool_id', poolId).eq('user_id', userId).select().single();
+    const { data, error } = await supabase.from('reward_claims')
+      .update({ status: 'claimed', claimed_at: new Date().toISOString() })
+      .eq('reward_pool_id', poolId).eq('user_id', userId).select().single();
     if (error) return safeError(res, 500, 'Failed to claim reward');
     await auditLog('CLAIM_REWARD', req.user.walletAddress, { poolId, userId }, 'INFO');
     res.json(data);
@@ -667,7 +599,8 @@ v1.get('/governance', async (req, res) => {
 
 v1.get('/governance/active', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').eq('status', 'active').gt('deadline', new Date().toISOString());
+    const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)')
+      .eq('status', 'active').gt('deadline', new Date().toISOString());
     if (error) return safeError(res, 500, 'Failed to fetch proposals');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -690,9 +623,7 @@ v1.post('/governance/vote', authenticateToken, async (req, res) => {
     if (!proposalId || !userId || !option) return safeError(res, 400, 'proposalId, userId and option required');
     const { data: existing } = await supabase.from('votes').select('id').eq('proposal_id', proposalId).eq('user_id', userId).single();
     if (existing) return safeError(res, 400, 'Already voted on this proposal');
-    const { data, error } = await supabase.from('votes').insert({
-      proposal_id: proposalId, user_id: userId, option, voting_power: 1
-    }).select().single();
+    const { data, error } = await supabase.from('votes').insert({ proposal_id: proposalId, user_id: userId, option, voting_power: 1 }).select().single();
     if (error) return safeError(res, 500, 'Failed to cast vote');
     await auditLog('CAST_VOTE', req.user.walletAddress, { proposalId, option }, 'INFO');
     res.json(data);
@@ -714,7 +645,7 @@ v1.post('/marketplace', authenticateToken, async (req, res) => {
     if (!body.brand_id || !body.price_bnb) return safeError(res, 400, 'brand_id and price_bnb required');
     const price = parseFloat(body.price_bnb);
     if (isNaN(price) || price <= 0) return safeError(res, 400, 'Price must be a positive number');
-    if (price > 10000) return safeError(res, 400, 'Price exceeds maximum allowed (10000 BNB)');
+    if (price > 10000) return safeError(res, 400, 'Price exceeds maximum allowed');
     const { data, error } = await supabase.from('marketplace_listings').insert({ ...body, price_bnb: price }).select().single();
     if (error) return safeError(res, 500, 'Failed to create listing');
     await auditLog('CREATE_LISTING', req.user.walletAddress, { brandId: body.brand_id, price }, 'INFO');
@@ -736,7 +667,9 @@ v1.put('/marketplace/:id/purchase', authenticateToken, async (req, res) => {
     }
     const suspicious = await transactionMonitor(buyerWallet, 'MARKETPLACE_PURCHASE');
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
-    const { data, error } = await supabase.from('marketplace_listings').update({ status: 'sold', buyer_wallet: buyerWallet, tx_hash: txHash, sold_at: new Date().toISOString() }).eq('id', id).select().single();
+    const { data, error } = await supabase.from('marketplace_listings')
+      .update({ status: 'sold', buyer_wallet: buyerWallet, tx_hash: txHash, sold_at: new Date().toISOString() })
+      .eq('id', id).select().single();
     if (error) return safeError(res, 500, 'Failed to process purchase');
     await auditLog('MARKETPLACE_PURCHASE', buyerWallet, { listingId: id, txHash }, 'INFO');
     res.json(data);
@@ -757,7 +690,8 @@ v1.put('/marketplace/:id/cancel', authenticateToken, async (req, res) => {
 v1.get('/missions', async (req, res) => {
   try {
     const { city, mission_type, difficulty } = sanitize(req.query);
-    let query = supabase.from('missions').select('*').eq('status', 'active').gt('deadline', new Date().toISOString()).order('created_at', { ascending: false });
+    let query = supabase.from('missions').select('*').eq('status', 'active')
+      .gt('deadline', new Date().toISOString()).order('created_at', { ascending: false });
     if (city) query = query.eq('city', city);
     if (mission_type) query = query.eq('mission_type', mission_type);
     if (difficulty) query = query.eq('difficulty', difficulty);
@@ -800,12 +734,8 @@ v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
     const { walletAddress, stakeTxHash } = sanitize(req.body);
     if (!walletAddress) return safeError(res, 400, 'walletAddress required');
     if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet address');
-    const { data: existingClaim } = await supabase
-      .from('mission_claims')
-      .select('id')
-      .eq('mission_id', id)
-      .eq('agent_wallet', walletAddress)
-      .single();
+    const { data: existingClaim } = await supabase.from('mission_claims').select('id')
+      .eq('mission_id', id).eq('agent_wallet', walletAddress).single();
     if (existingClaim) return safeError(res, 400, 'Already claimed this mission');
     if (stakeTxHash) {
       const verification = await verifyTransaction(stakeTxHash, walletAddress);
@@ -829,30 +759,20 @@ v1.post('/missions/claims/:claimId/submit', authenticateToken, missionSubmitLimi
     const claimId = sanitize(req.params.claimId);
     const { intel_text, intel_photos, intel_video_url, gps_lat, gps_lng } = sanitize(req.body);
     if (!intel_text) return safeError(res, 400, 'intel_text required');
-    if (intel_text.length > 5000) return safeError(res, 400, 'intel_text exceeds maximum length of 5000 characters');
+    if (intel_text.length > 5000) return safeError(res, 400, 'intel_text exceeds maximum length');
     if (intel_video_url && intel_video_url.length > 500) return safeError(res, 400, 'Video URL too long');
-    let gpsVerified = false;
-    let validLat = null;
-    let validLng = null;
+    let gpsVerified = false, validLat = null, validLng = null;
     if (gps_lat !== undefined && gps_lng !== undefined) {
-      const lat = parseFloat(gps_lat);
-      const lng = parseFloat(gps_lng);
-      if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      const lat = parseFloat(gps_lat), lng = parseFloat(gps_lng);
+      if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180)
         return safeError(res, 400, 'Invalid GPS coordinates');
-      }
-      validLat = lat;
-      validLng = lng;
-      gpsVerified = true;
+      validLat = lat; validLng = lng; gpsVerified = true;
     }
     const photos = Array.isArray(intel_photos) ? intel_photos.slice(0, 10) : null;
     const { data, error } = await supabase.from('mission_claims').update({
-      status: 'submitted',
-      intel_text: intel_text.substring(0, 5000),
-      intel_photos: photos,
-      intel_video_url: intel_video_url || null,
-      gps_lat: validLat,
-      gps_lng: validLng,
-      gps_verified: gpsVerified,
+      status: 'submitted', intel_text: intel_text.substring(0, 5000),
+      intel_photos: photos, intel_video_url: intel_video_url || null,
+      gps_lat: validLat, gps_lng: validLng, gps_verified: gpsVerified,
       submitted_at: new Date().toISOString()
     }).eq('id', claimId).select().single();
     if (error) return safeError(res, 500, 'Failed to submit mission');
@@ -865,119 +785,69 @@ v1.post('/missions/claims/:claimId/ai-verify', authenticateToken, missionVerifyL
   try {
     const claimId = sanitize(req.params.claimId);
     if (!claimId) return safeError(res, 400, 'claimId required');
-
-    const { data: claim, error: claimError } = await supabase
-      .from('mission_claims')
-      .select('*, missions(*)')
-      .eq('id', claimId)
-      .single();
-
+    const { data: claim, error: claimError } = await supabase.from('mission_claims')
+      .select('*, missions(*)').eq('id', claimId).single();
     if (claimError || !claim) return safeError(res, 404, 'Claim not found');
     if (claim.status !== 'submitted') return safeError(res, 400, 'Claim not in submitted state');
     if (!claim.intel_text) return safeError(res, 400, 'No intel submitted');
-
-    await supabase
-      .from('mission_claims')
-      .update({ status: 'ai_reviewing' })
-      .eq('id', claimId);
-
+    await supabase.from('mission_claims').update({ status: 'ai_reviewing' }).eq('id', claimId);
     const mission = claim.missions;
     const prompt = `You are ARIA, the AI verification system for LUXFI — a Web 4.0 RWA tokenization platform in Southeast Asia.
-
 Your job is to verify mission intel submitted by field agents.
-
 MISSION DETAILS:
 - Codename: ${sanitizePromptInput(mission?.codename || 'Unknown')}
 - Brand: ${sanitizePromptInput(mission?.brand_name || 'Unknown')}
 - City: ${sanitizePromptInput(mission?.city || 'Unknown')}
 - Mission Type: ${sanitizePromptInput(mission?.mission_type || 'Unknown')}
 - Difficulty: ${mission?.difficulty || 1}
-- Requirements: ${sanitizePromptInput(JSON.stringify(mission?.requirements || []))}
-
 AGENT INTEL SUBMITTED:
 ${sanitizePromptInput(claim.intel_text.substring(0, 3000))}
-
 GPS VERIFIED: ${claim.gps_verified ? 'YES' : 'NO'}
 PHOTOS SUBMITTED: ${claim.intel_photos ? claim.intel_photos.length : 0}
-
-Evaluate this intel submission and respond ONLY with a JSON object:
+Evaluate this intel and respond ONLY with JSON:
 {
   "score": 85,
   "approved": true,
   "reason": "Clear and detailed intel with GPS verification",
-  "feedback": "Excellent field work. Intel confirms brand presence.",
+  "feedback": "Excellent field work.",
   "flags": []
 }
-
-Score 0-100. Approve if score >= 70. Be strict but fair.`;
-
+Score 0-100. Approve if score >= 70.`;
     const aiResponse = await callClaudeWithFallback(prompt, 500);
     let verification;
-
     try {
-      const cleaned = aiResponse.replace(/```json|```/g, '').trim();
-      verification = JSON.parse(cleaned);
+      verification = JSON.parse(aiResponse.replace(/```json|```/g, '').trim());
     } catch {
-      verification = {
-        score: 50,
-        approved: false,
-        reason: 'AI parsing error — manual review required',
-        feedback: 'System error during verification',
-        flags: ['PARSE_ERROR']
-      };
+      verification = { score: 50, approved: false, reason: 'AI parsing error', feedback: 'System error', flags: ['PARSE_ERROR'] };
     }
-
     const score = Math.min(100, Math.max(0, parseInt(verification.score) || 0));
     const approved = score >= 70 && verification.approved === true;
     const newStatus = approved ? 'approved' : 'rejected';
-
-    await supabase
-      .from('mission_claims')
-      .update({
-        status: newStatus,
-        ai_score: score,
-        ai_verified: true,
-        ai_feedback: verification.feedback,
-      })
-      .eq('id', claimId);
-
+    await supabase.from('mission_claims').update({
+      status: newStatus, ai_score: score, ai_verified: true, ai_feedback: verification.feedback
+    }).eq('id', claimId);
     if (approved) {
       const difficulty = mission?.difficulty || 1;
-      const rewardMap = {
-        1: { luxfi: 100, bnb: 0.001, badge: 'Bronze' },
-        2: { luxfi: 500, bnb: 0.005, badge: 'Gold' },
-        3: { luxfi: 2500, bnb: 0.025, badge: 'Diamond' }
-      };
+      const rewardMap = { 1: { luxfi: 100, bnb: 0.001, badge: 'Bronze' }, 2: { luxfi: 500, bnb: 0.005, badge: 'Gold' }, 3: { luxfi: 2500, bnb: 0.025, badge: 'Diamond' } };
       const reward = rewardMap[difficulty] || rewardMap[1];
-      await supabase
-        .from('mission_claims')
-        .update({
-          luxfi_reward_amount: reward.luxfi,
-          bnb_reward_amount: reward.bnb,
-          nft_badge_tier: difficulty,
-          reward_status: 'pending_distribution'
-        })
-        .eq('id', claimId);
-      await auditLog('MISSION_AI_APPROVED', claim.agent_wallet, { claimId, score, reward, missionId: claim.mission_id }, 'INFO');
+      await supabase.from('mission_claims').update({
+        luxfi_reward_amount: reward.luxfi, bnb_reward_amount: reward.bnb,
+        nft_badge_tier: difficulty, reward_status: 'pending_distribution'
+      }).eq('id', claimId);
+      await auditLog('MISSION_AI_APPROVED', claim.agent_wallet, { claimId, score, reward }, 'INFO');
     } else {
-      await auditLog('MISSION_AI_REJECTED', claim.agent_wallet, { claimId, score, reason: verification.reason, flags: verification.flags }, 'WARN');
+      await auditLog('MISSION_AI_REJECTED', claim.agent_wallet, { claimId, score, reason: verification.reason }, 'WARN');
     }
-
     const diffIdx = Math.min((mission?.difficulty || 1) - 1, 2);
     res.json({
-      claimId,
-      score,
-      approved,
-      status: newStatus,
-      feedback: verification.feedback,
-      reason: verification.reason,
+      claimId, score, approved, status: newStatus,
+      feedback: verification.feedback, reason: verification.reason,
       reward: approved ? {
         luxfi: `${[100, 500, 2500][diffIdx]} LUXFI`,
         bnb: `${[0.001, 0.005, 0.025][diffIdx]} BNB`,
         badge: ['Bronze', 'Gold', 'Diamond'][diffIdx]
       } : null
     });
-
   } catch (err) {
     logger.error({ message: 'AI verification failed', err: err.message });
     Sentry.captureException(err);
@@ -1003,9 +873,188 @@ v1.get('/missions/agent/:wallet', authenticateToken, async (req, res) => {
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
     const [profileRes, claimsRes] = await Promise.all([
       supabase.from('agent_profiles').select('*').eq('wallet_address', wallet).single(),
-      supabase.from('mission_claims').select('*, missions(codename, mission_type, city, reward_bnb, difficulty)').eq('agent_wallet', wallet).order('claimed_at', { ascending: false }).limit(20)
+      supabase.from('mission_claims').select('*, missions(codename, mission_type, city, difficulty)')
+        .eq('agent_wallet', wallet).order('claimed_at', { ascending: false }).limit(20)
     ]);
     res.json({ profile: profileRes.data, missions: claimsRes.data });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── NEW: AGENT REGISTRATION ──────────────────────────────
+v1.post('/agents/register', authenticateToken, async (req, res) => {
+  try {
+    const { codename } = sanitize(req.body);
+    if (!codename || codename.length < 3) return safeError(res, 400, 'Codename must be at least 3 characters');
+    if (codename.length > 30) return safeError(res, 400, 'Codename too long');
+    const { data: existing } = await supabase.from('agent_profiles')
+      .select('id').eq('wallet_address', req.user.walletAddress).single();
+    if (existing) return safeError(res, 400, 'Agent already registered');
+    const { data: codenameTaken } = await supabase.from('agent_profiles')
+      .select('id').eq('codename', codename).single();
+    if (codenameTaken) return safeError(res, 400, 'Codename already taken');
+    const { data, error } = await supabase.from('agent_profiles').insert({
+      wallet_address: req.user.walletAddress,
+      codename: codename,
+      xp: 0,
+      missions_completed: 0,
+      missions_attempted: 0,
+      reputation_score: 500,
+      clearance_level: 'ROOKIE',
+      badges_earned: [],
+      total_earned: 0,
+      total_staked: 0,
+      is_blacklisted: false,
+      joined_at: new Date().toISOString()
+    }).select().single();
+    if (error) return safeError(res, 500, 'Failed to register agent');
+    await auditLog('AGENT_REGISTERED', req.user.walletAddress, { codename }, 'INFO');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/agents/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('agent_profiles').select('*').eq('wallet_address', wallet).single();
+    if (error) return safeError(res, 404, 'Agent not found');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/agents/:wallet/badges', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('nft_badges').select('*').eq('wallet_address', wallet).order('minted_at', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch badges');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── NEW: RWA PURCHASE RECORDING ─────────────────────────
+v1.post('/rwa/purchase', authenticateToken, async (req, res) => {
+  try {
+    const { brandId, luxfiAmount, bnbPaid, txHash } = sanitize(req.body);
+    if (!brandId || !luxfiAmount || !bnbPaid || !txHash) return safeError(res, 400, 'brandId, luxfiAmount, bnbPaid and txHash required');
+    if (parseFloat(bnbPaid) <= 0) return safeError(res, 400, 'Invalid BNB amount');
+    if (parseFloat(luxfiAmount) <= 0) return safeError(res, 400, 'Invalid LUXFI amount');
+    if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) return safeError(res, 400, 'Invalid transaction hash');
+    const verification = await verifyTransaction(txHash, req.user.walletAddress);
+    if (!verification.valid) {
+      await auditLog('INVALID_RWA_PURCHASE', req.user.walletAddress, { txHash, reason: verification.reason }, 'WARN');
+      return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
+    }
+    const suspicious = await transactionMonitor(req.user.walletAddress, 'RWA_PURCHASE');
+    if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
+    const { data, error } = await supabase.from('rwa_purchases').insert({
+      wallet_address: req.user.walletAddress,
+      brand_id: brandId,
+      luxfi_amount: parseFloat(luxfiAmount),
+      bnb_paid: parseFloat(bnbPaid),
+      tx_hash: txHash,
+      status: 'confirmed'
+    }).select().single();
+    if (error) return safeError(res, 500, 'Failed to record RWA purchase');
+    await auditLog('RWA_PURCHASE', req.user.walletAddress, { brandId, luxfiAmount, bnbPaid, txHash }, 'INFO');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/rwa/purchases/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('rwa_purchases').select('*, brands(name, city)')
+      .eq('wallet_address', wallet).order('created_at', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch purchases');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── NEW: STAKING ─────────────────────────────────────────
+v1.post('/staking/stake', authenticateToken, async (req, res) => {
+  try {
+    const { luxfiAmount, txHash } = sanitize(req.body);
+    if (!luxfiAmount || !txHash) return safeError(res, 400, 'luxfiAmount and txHash required');
+    if (parseFloat(luxfiAmount) <= 0) return safeError(res, 400, 'Invalid staking amount');
+    if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) return safeError(res, 400, 'Invalid transaction hash');
+    const verification = await verifyTransaction(txHash, req.user.walletAddress);
+    if (!verification.valid) {
+      await auditLog('INVALID_STAKE_TX', req.user.walletAddress, { txHash, reason: verification.reason }, 'WARN');
+      return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
+    }
+    const { data, error } = await supabase.from('staking_positions').insert({
+      wallet_address: req.user.walletAddress,
+      luxfi_staked: parseFloat(luxfiAmount),
+      stake_tx_hash: txHash,
+      status: 'active'
+    }).select().single();
+    if (error) return safeError(res, 500, 'Failed to record staking position');
+    await auditLog('STAKE', req.user.walletAddress, { luxfiAmount, txHash }, 'INFO');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.post('/staking/unstake', authenticateToken, async (req, res) => {
+  try {
+    const { positionId, txHash } = sanitize(req.body);
+    if (!positionId || !txHash) return safeError(res, 400, 'positionId and txHash required');
+    if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) return safeError(res, 400, 'Invalid transaction hash');
+    const verification = await verifyTransaction(txHash, req.user.walletAddress);
+    if (!verification.valid) return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
+    const { data, error } = await supabase.from('staking_positions').update({
+      status: 'unstaked', unstake_tx_hash: txHash, unstaked_at: new Date().toISOString()
+    }).eq('id', positionId).eq('wallet_address', req.user.walletAddress).select().single();
+    if (error) return safeError(res, 500, 'Failed to update staking position');
+    await auditLog('UNSTAKE', req.user.walletAddress, { positionId, txHash }, 'INFO');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/staking/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('staking_positions').select('*')
+      .eq('wallet_address', wallet).eq('status', 'active').order('staked_at', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch staking positions');
+    const totalStaked = data.reduce((sum, pos) => sum + parseFloat(pos.luxfi_staked || 0), 0);
+    res.json({ positions: data, totalStaked });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── NEW: MISSION REWARD DISTRIBUTION ────────────────────
+v1.post('/missions/rewards/distribute', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const { claimId } = sanitize(req.body);
+    if (!claimId) return safeError(res, 400, 'claimId required');
+    const { data: claim, error } = await supabase.from('mission_claims').select('*').eq('id', claimId).single();
+    if (error || !claim) return safeError(res, 404, 'Claim not found');
+    if (claim.reward_status !== 'pending_distribution') return safeError(res, 400, 'Reward not pending distribution');
+    if (claim.status !== 'approved') return safeError(res, 400, 'Claim not approved');
+    await supabase.from('nft_badges').insert({
+      wallet_address: claim.agent_wallet,
+      badge_tier: claim.nft_badge_tier || 1,
+      badge_name: ['Bronze', 'Gold', 'Diamond'][Math.min((claim.nft_badge_tier || 1) - 1, 2)],
+      mission_id: claim.mission_id,
+      claim_id: claimId
+    });
+    await supabase.from('mission_claims').update({ reward_status: 'distributed', distributed_at: new Date().toISOString() }).eq('id', claimId);
+    await auditLog('REWARD_DISTRIBUTED', claim.agent_wallet, {
+      claimId, luxfi: claim.luxfi_reward_amount, bnb: claim.bnb_reward_amount, badge: claim.nft_badge_tier
+    }, 'INFO');
+    res.json({
+      success: true,
+      claimId,
+      agentWallet: claim.agent_wallet,
+      luxfiRewarded: claim.luxfi_reward_amount,
+      bnbRewarded: claim.bnb_reward_amount,
+      badgeTier: claim.nft_badge_tier,
+      note: 'On-chain distribution pending contract deployment'
+    });
   } catch { safeError(res, 500, 'Server error'); }
 });
 
@@ -1016,15 +1065,11 @@ v1.post('/ai/generate-mission', async (req, res) => {
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
     const { brand, missionType, city, difficulty } = sanitize(req.body);
     if (!brand || !missionType || !city) return safeError(res, 400, 'brand, missionType and city required');
-    const safeBrand = sanitizePromptInput(brand);
-    const safeMissionType = sanitizePromptInput(missionType);
-    const safeCity = sanitizePromptInput(city);
-    const safeDifficulty = sanitizePromptInput(difficulty || 'ROUTINE');
     const prompt = `You are the AI agent behind LUXFI, a blockchain platform tokenizing real-world lifestyle brands in Southeast Asia. Generate a dramatic spy-style mission briefing.
-Brand: ${safeBrand}
-Mission Type: ${safeMissionType}
-City: ${safeCity}
-Difficulty: ${safeDifficulty}
+Brand: ${sanitizePromptInput(brand)}
+Mission Type: ${sanitizePromptInput(missionType)}
+City: ${sanitizePromptInput(city)}
+Difficulty: ${sanitizePromptInput(difficulty || 'ROUTINE')}
 Return ONLY a JSON object with no markdown, no backticks:
 {
   "codename": "OPERATION [DRAMATIC TWO WORD NAME IN CAPS]",
@@ -1033,7 +1078,7 @@ Return ONLY a JSON object with no markdown, no backticks:
 }`;
     const result = await callClaudeWithFallback(prompt);
     const mission = JSON.parse(result);
-    await auditLog('GENERATE_MISSION', 'admin', { brand: safeBrand, city: safeCity }, 'INFO');
+    await auditLog('GENERATE_MISSION', 'admin', { brand, city }, 'INFO');
     res.json(mission);
   } catch (err) {
     logger.error({ message: 'Mission generation failed', err: err.message });
@@ -1126,3 +1171,4 @@ app.use((err, req, res, next) => {
 // ─── START ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
+
