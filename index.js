@@ -1439,7 +1439,198 @@ v1.get('/rwa/purchases/:wallet', authenticateToken, async (req, res) => {
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
+// ─── RBO — REAL BRAND OWNERSHIP ──────────────────────────────────
 
+// Purchase RBO shares
+v1.post('/rbo/purchase', authenticateToken, async (req, res) => {
+  try {
+    const { brandId, numberOfShares, walletAddress } = sanitize(req.body);
+    if (!brandId || !numberOfShares || !walletAddress) return safeError(res, 400, 'brandId, numberOfShares and walletAddress required');
+    if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet');
+
+    // Get brand from DB
+    const { data: brand, error: brandErr } = await supabase.from('rbo_brands').select('*').eq('brand_id', brandId).single();
+    if (brandErr || !brand) return safeError(res, 404, 'Brand not found');
+
+    const totalCostUSD = brand.share_price_usd * numberOfShares;
+
+    // Record purchase
+    const { data, error } = await supabase.from('rbo_positions').upsert({
+      wallet_address: walletAddress,
+      brand_id: brandId,
+      shares_held: numberOfShares,
+      purchase_price_usd: brand.share_price_usd,
+      total_invested_usd: totalCostUSD,
+      loyalty_multiplier: 1.00,
+      compounding: true,
+      purchased_at: new Date().toISOString()
+    }, { onConflict: 'wallet_address,brand_id' }).select().single();
+
+    if (error) return safeError(res, 500, 'Failed to record purchase');
+
+    await auditLog('RBO_PURCHASE', walletAddress, { brandId, shares: numberOfShares, costUSD: totalCostUSD }, 'INFO');
+    res.json({ success: true, position: data, totalCostUSD, sharePrice: brand.share_price_usd });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// Request exit (tiered)
+v1.post('/rbo/exit', authenticateToken, async (req, res) => {
+  try {
+    const { brandId, shares, tier, walletAddress } = sanitize(req.body);
+    if (!brandId || !shares || !tier || !walletAddress) return safeError(res, 400, 'brandId, shares, tier and walletAddress required');
+    if (![1,2,3].includes(parseInt(tier))) return safeError(res, 400, 'Tier must be 1 (instant), 2 (7-day), or 3 (30-day)');
+
+    const { data: brand } = await supabase.from('rbo_brands').select('*').eq('brand_id', brandId).single();
+    const { data: pos }   = await supabase.from('rbo_positions').select('*').eq('wallet_address', walletAddress).eq('brand_id', brandId).single();
+    if (!pos || pos.shares_held < shares) return safeError(res, 400, 'Insufficient shares');
+
+    const grossUSD = shares * brand.share_price_usd;
+    const feeRates = {1: 0.05, 2: 0.01, 3: 0};
+    const feeUSD   = grossUSD * feeRates[tier];
+    const netUSD   = grossUSD - feeUSD;
+
+    const holderFee   = feeUSD * 0.60;
+    const treasuryFee = feeUSD * 0.40;
+
+    const processAt = tier === 1 ? new Date().toISOString()
+      : tier === 2 ? new Date(Date.now() + 7*24*60*60*1000).toISOString()
+      : new Date(Date.now() + 30*24*60*60*1000).toISOString();
+
+    const { data, error } = await supabase.from('rbo_exits').insert({
+      wallet_address: walletAddress,
+      brand_id: brandId,
+      shares,
+      tier,
+      gross_usd: grossUSD,
+      fee_usd: feeUSD,
+      net_usd: netUSD,
+      holder_fee_usd: holderFee,
+      treasury_fee_usd: treasuryFee,
+      status: tier === 1 ? 'processed' : 'pending',
+      requested_at: new Date().toISOString(),
+      process_at: processAt
+    }).select().single();
+
+    if (error) return safeError(res, 500, 'Failed to record exit request');
+
+    // Deduct shares from position
+    await supabase.from('rbo_positions').update({
+      shares_held: pos.shares_held - shares,
+      compounding: false
+    }).eq('wallet_address', walletAddress).eq('brand_id', brandId);
+
+    await auditLog('RBO_EXIT', walletAddress, { brandId, tier, shares, netUSD }, 'INFO');
+
+    const messages = {
+      1: `Instant exit: receiving $${netUSD.toFixed(2)} (5% fee applied)`,
+      2: `7-day exit: receiving $${netUSD.toFixed(2)} in 7 days (1% fee applied)`,
+      3: `30-day exit: receiving $${(netUSD * 1.005).toFixed(2)} in 30 days (0% fee + 0.5% bonus)`
+    };
+    res.json({ success: true, exit: data, message: messages[tier] });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// Get investor portfolio
+v1.get('/rbo/portfolio/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet');
+
+    const [positions, exits, brands] = await Promise.all([
+      supabase.from('rbo_positions').select('*, rbo_brands(*)').eq('wallet_address', wallet).gt('shares_held', 0),
+      supabase.from('rbo_exits').select('*').eq('wallet_address', wallet).order('requested_at', { ascending: false }).limit(10),
+      supabase.from('rbo_brands').select('*').eq('active', true)
+    ]);
+
+    const totalValueUSD = (positions.data || []).reduce((sum, p) => {
+      const currentPrice = p.rbo_brands?.share_price_usd || p.purchase_price_usd;
+      return sum + p.shares_held * currentPrice;
+    }, 0);
+
+    res.json({
+      positions: positions.data || [],
+      recentExits: exits.data || [],
+      totalValueUSD: totalValueUSD.toFixed(2),
+      availableBrands: brands.data || []
+    });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// Get brand RBO details
+v1.get('/rbo/brand/:brandId', async (req, res) => {
+  try {
+    const brandId = sanitize(req.params.brandId);
+    const { data: brand } = await supabase.from('rbo_brands').select('*').eq('brand_id', brandId).single();
+    if (!brand) return safeError(res, 404, 'Brand not found');
+
+    const { data: holders } = await supabase.from('rbo_positions').select('wallet_address, shares_held, loyalty_multiplier').eq('brand_id', brandId).gt('shares_held', 0);
+    const totalSharesHeld = (holders || []).reduce((s, h) => s + h.shares_held, 0);
+
+    res.json({ brand, holders: holders?.length || 0, totalSharesHeld, availableShares: brand.total_shares - totalSharesHeld });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// Secondary market — list shares
+v1.post('/rbo/secondary/list', authenticateToken, async (req, res) => {
+  try {
+    const { brandId, shares, pricePerShareUSD, walletAddress } = sanitize(req.body);
+    const { data: brand } = await supabase.from('rbo_brands').select('share_price_usd').eq('brand_id', brandId).single();
+    const { data: pos }   = await supabase.from('rbo_positions').select('shares_held').eq('wallet_address', walletAddress).eq('brand_id', brandId).single();
+    if (!pos || pos.shares_held < shares) return safeError(res, 400, 'Insufficient shares');
+
+    const maxPrice = brand.share_price_usd * 1.10;
+    const minPrice = brand.share_price_usd * 0.90;
+    if (pricePerShareUSD > maxPrice || pricePerShareUSD < minPrice) return safeError(res, 400, 'Price must be within 10% of ARIA price');
+
+    await supabase.from('rbo_positions').update({ shares_held: pos.shares_held - shares }).eq('wallet_address', walletAddress).eq('brand_id', brandId);
+
+    const { data, error } = await supabase.from('rbo_secondary_listings').insert({
+      seller_wallet: walletAddress, brand_id: brandId, shares,
+      price_per_share_usd: pricePerShareUSD, status: 'active',
+      listed_at: new Date().toISOString()
+    }).select().single();
+
+    if (error) return safeError(res, 500, 'Failed to create listing');
+    res.json({ success: true, listing: data });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// Secondary market — buy shares
+v1.post('/rbo/secondary/buy', authenticateToken, async (req, res) => {
+  try {
+    const { listingId, walletAddress } = sanitize(req.body);
+    const { data: listing } = await supabase.from('rbo_secondary_listings').select('*').eq('id', listingId).eq('status', 'active').single();
+    if (!listing) return safeError(res, 404, 'Listing not found or inactive');
+    if (listing.seller_wallet === walletAddress) return safeError(res, 400, 'Cannot buy own listing');
+
+    const totalUSD   = listing.shares * listing.price_per_share_usd;
+    const sellerFee  = totalUSD * 0.01;
+    const buyerFee   = totalUSD * 0.01;
+    const sellerGets = totalUSD - sellerFee;
+
+    await supabase.from('rbo_secondary_listings').update({ status: 'sold', sold_at: new Date().toISOString(), buyer_wallet: walletAddress }).eq('id', listingId);
+
+    const { data: existing } = await supabase.from('rbo_positions').select('shares_held').eq('wallet_address', walletAddress).eq('brand_id', listing.brand_id).single();
+    if (existing) {
+      await supabase.from('rbo_positions').update({ shares_held: existing.shares_held + listing.shares }).eq('wallet_address', walletAddress).eq('brand_id', listing.brand_id);
+    } else {
+      await supabase.from('rbo_positions').insert({ wallet_address: walletAddress, brand_id: listing.brand_id, shares_held: listing.shares, purchase_price_usd: listing.price_per_share_usd, loyalty_multiplier: 1.00, compounding: true, purchased_at: new Date().toISOString() });
+    }
+
+    await auditLog('RBO_SECONDARY_BUY', walletAddress, { listingId, totalUSD, buyerFee }, 'INFO');
+    res.json({ success: true, sharesAcquired: listing.shares, totalPaidUSD: totalUSD + buyerFee, platformFeeUSD: sellerFee + buyerFee });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// Secondary market — get listings
+v1.get('/rbo/secondary/:brandId', async (req, res) => {
+  try {
+    const brandId = sanitize(req.params.brandId);
+    const { data, error } = await supabase.from('rbo_secondary_listings').select('*').eq('brand_id', brandId).eq('status', 'active').order('listed_at', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch listings');
+    res.json(data || []);
+  } catch { safeError(res, 500, 'Server error'); }
+});
 // ─── STAKING ──────────────────────────────────────────────
 v1.post('/staking/stake', authenticateToken, async (req, res) => {
   try {
