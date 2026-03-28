@@ -356,8 +356,11 @@ const updateAgentProgress = async (walletAddress, difficulty, luxfiEarned) => {
     if (lastDate === yesterday) newStreak = (agent.current_streak || 0) + 1;
     else if (lastDate === today) newStreak = agent.current_streak || 1;
     const xpGained = XP_REWARDS[difficulty] || 100;
-    const multiplier = getStreakMultiplier(newStreak);
-    const finalXP = Math.floor(xpGained * multiplier);
+    const streakMultiplier = getStreakMultiplier(newStreak);
+    const { data: loyaltyBoosts } = await supabase.from('loyalty_staking_boosts').select('xp_boost_percent').eq('wallet_address', walletAddress).eq('active', true);
+    const loyaltyBoost = (loyaltyBoosts || []).reduce((sum, b) => sum + (b.xp_boost_percent || 0), 0);
+    const totalMultiplier = streakMultiplier * (1 + loyaltyBoost / 100);
+    const finalXP = Math.floor(xpGained * totalMultiplier);
     const newMissionsCompleted = (agent.missions_completed || 0) + 1;
     const newClearance = getClearanceLevel(newMissionsCompleted);
     await supabase.from('agent_profiles').update({
@@ -376,7 +379,7 @@ const updateAgentProgress = async (walletAddress, difficulty, luxfiEarned) => {
       season_xp: (agent.season_xp || 0) + finalXP,
       missions_completed: newMissionsCompleted,
     }, { onConflict: 'wallet_address' });
-    return { xpGained: finalXP, multiplier, newStreak, newClearance };
+    return { xpGained: finalXP, streakMultiplier, loyaltyBoost, newStreak, newClearance };
   } catch (err) {
     logger.error({ message: 'Failed to update agent progress', err: err.message });
   }
@@ -776,7 +779,8 @@ v1.get('/missions/flash', async (req, res) => {
 
 v1.get('/missions/leaderboard', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('agent_profiles').select('codename, wallet_address, xp, missions_completed, clearance_level, current_streak, season_xp')
+    const { data, error } = await supabase.from('agent_profiles')
+      .select('codename, wallet_address, xp, missions_completed, clearance_level, current_streak, season_xp')
       .order('season_xp', { ascending: false }).limit(20);
     if (error) return safeError(res, 500, 'Failed to fetch leaderboard');
     res.json(data);
@@ -813,17 +817,14 @@ v1.post('/missions/nearby', authenticateToken, async (req, res) => {
     const nearby = [];
     for (const loc of locations || []) {
       const distance = haversineDistance(userLat, userLng, parseFloat(loc.lat), parseFloat(loc.lng));
-      if (distance <= loc.radius_meters) {
-        nearby.push({ ...loc, distance: Math.round(distance) });
-      }
+      if (distance <= loc.radius_meters) nearby.push({ ...loc, distance: Math.round(distance) });
     }
-    if (nearby.length === 0) return res.json({ nearby: [], missions: [] });
+    if (nearby.length === 0) return res.json({ nearby: [], missions: [], ghostSignal: false });
     const brandNames = [...new Set(nearby.map(l => l.brand_name))];
     const { data: missions } = await supabase.from('missions').select('*')
-      .eq('status', 'active').gt('deadline', new Date().toISOString())
-      .in('brand_name', brandNames);
+      .eq('status', 'active').gt('deadline', new Date().toISOString()).in('brand_name', brandNames);
     await auditLog('GHOST_SIGNAL', req.user.walletAddress, { nearby: nearby.length, brands: brandNames }, 'INFO');
-    res.json({ nearby, missions: missions || [], ghostSignal: nearby.length > 0 });
+    res.json({ nearby, missions: missions || [], ghostSignal: true });
   } catch { safeError(res, 500, 'Server error'); }
 });
 
@@ -977,12 +978,7 @@ v1.get('/gamification/agent/:wallet', authenticateToken, async (req, res) => {
     const nextLevel = CLEARANCE_LEVELS.find(l => l.min > (data.missions_completed || 0));
     const missionsToNextLevel = nextLevel ? nextLevel.min - (data.missions_completed || 0) : 0;
     const streakMultiplier = getStreakMultiplier(data.current_streak || 0);
-    res.json({
-      ...data,
-      streakMultiplier,
-      missionsToNextLevel,
-      nextClearanceLevel: nextLevel?.level || 'MAX LEVEL'
-    });
+    res.json({ ...data, streakMultiplier, missionsToNextLevel, nextClearanceLevel: nextLevel?.level || 'MAX LEVEL' });
   } catch { safeError(res, 500, 'Server error'); }
 });
 
@@ -1069,24 +1065,164 @@ v1.post('/gamification/flash-mission', async (req, res) => {
       mission_type: missionType || 'LOCATION_SURVEILLANCE',
       briefing: `URGENT. ARIA has detected unusual activity at ${brandName} in ${city}. First 3 agents to submit verified intel receive bonus rewards. Time is critical.`,
       requirements: ['Photograph the location immediately', 'Report crowd density', 'Note any unusual activity', 'Submit within 2 hours'],
-      difficulty: 2,
-      reward_bnb: 0.005,
-      reward_luxfi: 500,
-      flash_bonus_luxfi: bonusLuxfi || 250,
-      stake_required_bnb: 0.001,
-      status: 'active',
-      is_flash_mission: true,
-      is_competitor_mission: true,
-      competitor_brand: brandName,
-      flash_expires_at: flashExpiry,
-      deadline,
-      max_agents: 3,
+      difficulty: 2, reward_bnb: 0.005, reward_luxfi: 500,
+      flash_bonus_luxfi: bonusLuxfi || 250, stake_required_bnb: 0.001,
+      status: 'active', is_flash_mission: true, is_competitor_mission: true,
+      competitor_brand: brandName, flash_expires_at: flashExpiry, deadline, max_agents: 3,
       created_at: new Date().toISOString()
     }).select().single();
     if (error) return safeError(res, 500, 'Failed to create flash mission');
     await auditLog('FLASH_MISSION_CREATED', 'admin', { brandName, city }, 'INFO');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── DOUBLE AGENT MISSIONS ────────────────────────────────
+v1.post('/gamification/double-agent/start', authenticateToken, async (req, res) => {
+  try {
+    const { luxfiMissionId, competitorMissionId } = sanitize(req.body);
+    if (!luxfiMissionId || !competitorMissionId) return safeError(res, 400, 'luxfiMissionId and competitorMissionId required');
+    const [luxfiMission, competitorMission] = await Promise.all([
+      supabase.from('missions').select('*').eq('id', luxfiMissionId).single(),
+      supabase.from('missions').select('*').eq('id', competitorMissionId).single(),
+    ]);
+    if (!luxfiMission.data) return safeError(res, 404, 'LUXFI mission not found');
+    if (!competitorMission.data) return safeError(res, 404, 'Competitor mission not found');
+    if (!competitorMission.data.is_competitor_mission) return safeError(res, 400, 'Second mission must be a competitor mission');
+    if (luxfiMission.data.is_competitor_mission) return safeError(res, 400, 'First mission must be a LUXFI brand mission');
+    const { data: existing } = await supabase.from('double_agent_missions').select('id')
+      .eq('wallet_address', req.user.walletAddress).eq('status', 'pending').single();
+    if (existing) return safeError(res, 400, 'You already have an active double agent mission');
+    const { data, error } = await supabase.from('double_agent_missions').insert({
+      wallet_address: req.user.walletAddress,
+      luxfi_mission_id: luxfiMissionId,
+      competitor_mission_id: competitorMissionId,
+      bonus_luxfi: 500, bonus_xp: 300, status: 'pending'
+    }).select().single();
+    if (error) return safeError(res, 500, 'Failed to start double agent mission');
+    await auditLog('DOUBLE_AGENT_START', req.user.walletAddress, { luxfiMissionId, competitorMissionId }, 'INFO');
+    res.json({ ...data, message: 'Double agent mission started. Complete both missions to earn bonus rewards.', bonusReward: { luxfi: 500, xp: 300 } });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.post('/gamification/double-agent/complete', authenticateToken, async (req, res) => {
+  try {
+    const { doubleAgentId, luxfiClaimId, competitorClaimId } = sanitize(req.body);
+    if (!doubleAgentId || !luxfiClaimId || !competitorClaimId) return safeError(res, 400, 'doubleAgentId, luxfiClaimId and competitorClaimId required');
+    const { data: doubleAgent } = await supabase.from('double_agent_missions').select('*').eq('id', doubleAgentId).eq('wallet_address', req.user.walletAddress).single();
+    if (!doubleAgent) return safeError(res, 404, 'Double agent mission not found');
+    if (doubleAgent.status === 'completed') return safeError(res, 400, 'Already completed');
+    const [luxfiClaim, competitorClaim] = await Promise.all([
+      supabase.from('mission_claims').select('*').eq('id', luxfiClaimId).single(),
+      supabase.from('mission_claims').select('*').eq('id', competitorClaimId).single(),
+    ]);
+    if (luxfiClaim.data?.status !== 'approved') return safeError(res, 400, 'LUXFI mission claim not approved yet');
+    if (competitorClaim.data?.status !== 'approved') return safeError(res, 400, 'Competitor mission claim not approved yet');
+    await supabase.from('double_agent_missions').update({
+      status: 'completed', luxfi_claim_id: luxfiClaimId,
+      competitor_claim_id: competitorClaimId, completed_at: new Date().toISOString()
+    }).eq('id', doubleAgentId);
+    const { data: agent } = await supabase.from('agent_profiles').select('xp, season_xp, total_luxfi_earned').eq('wallet_address', req.user.walletAddress).single();
+    if (agent) {
+      await supabase.from('agent_profiles').update({
+        xp: (agent.xp || 0) + doubleAgent.bonus_xp,
+        season_xp: (agent.season_xp || 0) + doubleAgent.bonus_xp,
+        total_luxfi_earned: (agent.total_luxfi_earned || 0) + doubleAgent.bonus_luxfi
+      }).eq('wallet_address', req.user.walletAddress);
+    }
+    await supabase.from('notifications').insert({
+      wallet_address: req.user.walletAddress,
+      type: 'DOUBLE_AGENT_COMPLETE',
+      title: 'DOUBLE AGENT MISSION COMPLETE',
+      message: `Outstanding field work, Agent. You have earned ${doubleAgent.bonus_luxfi} bonus LUXFI and ${doubleAgent.bonus_xp} bonus XP.`,
+      data: { bonusLuxfi: doubleAgent.bonus_luxfi, bonusXp: doubleAgent.bonus_xp },
+      read: false
+    });
+    await auditLog('DOUBLE_AGENT_COMPLETE', req.user.walletAddress, { doubleAgentId, bonusLuxfi: doubleAgent.bonus_luxfi }, 'INFO');
+    res.json({ success: true, bonusLuxfi: doubleAgent.bonus_luxfi, bonusXp: doubleAgent.bonus_xp });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/gamification/double-agent/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('double_agent_missions')
+      .select('*, luxfi_mission:luxfi_mission_id(codename, brand_name, city), competitor_mission:competitor_mission_id(codename, brand_name, city)')
+      .eq('wallet_address', wallet).order('created_at', { ascending: false }).limit(10);
+    if (error) return safeError(res, 500, 'Failed to fetch double agent missions');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── BRAND LOYALTY STAKING BOOST ──────────────────────────
+v1.post('/gamification/loyalty-boost/stake', authenticateToken, async (req, res) => {
+  try {
+    const { brandName, luxfiStaked } = sanitize(req.body);
+    if (!brandName || !luxfiStaked) return safeError(res, 400, 'brandName and luxfiStaked required');
+    const staked = parseFloat(luxfiStaked);
+    if (isNaN(staked) || staked <= 0) return safeError(res, 400, 'Invalid staking amount');
+    const validBrands = ['Clay & Cloud', 'Little Nonya'];
+    if (!validBrands.includes(brandName)) return safeError(res, 400, 'Brand not eligible for loyalty boost');
+    let xpBoostPercent = 0;
+    if (staked >= 10000) xpBoostPercent = 50;
+    else if (staked >= 5000) xpBoostPercent = 30;
+    else if (staked >= 1000) xpBoostPercent = 15;
+    else if (staked >= 500) xpBoostPercent = 10;
+    else if (staked >= 100) xpBoostPercent = 5;
+    const { data: existing } = await supabase.from('loyalty_staking_boosts').select('*')
+      .eq('wallet_address', req.user.walletAddress).eq('brand_name', brandName).single();
+    let result;
+    if (existing) {
+      const { data } = await supabase.from('loyalty_staking_boosts').update({
+        luxfi_staked: staked, xp_boost_percent: xpBoostPercent,
+        active: true, updated_at: new Date().toISOString()
+      }).eq('id', existing.id).select().single();
+      result = data;
+    } else {
+      const { data } = await supabase.from('loyalty_staking_boosts').insert({
+        wallet_address: req.user.walletAddress, brand_name: brandName,
+        luxfi_staked: staked, xp_boost_percent: xpBoostPercent, active: true
+      }).select().single();
+      result = data;
+    }
+    await auditLog('LOYALTY_BOOST_STAKE', req.user.walletAddress, { brandName, staked, xpBoostPercent }, 'INFO');
+    res.json({
+      ...result,
+      message: `Loyalty boost activated. You earn ${xpBoostPercent}% bonus XP on all ${brandName} missions.`,
+      boostTiers: [
+        { minStake: 100, boost: '5% XP bonus' },
+        { minStake: 500, boost: '10% XP bonus' },
+        { minStake: 1000, boost: '15% XP bonus' },
+        { minStake: 5000, boost: '30% XP bonus' },
+        { minStake: 10000, boost: '50% XP bonus' },
+      ]
+    });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/gamification/loyalty-boost/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('loyalty_staking_boosts').select('*').eq('wallet_address', wallet).eq('active', true);
+    if (error) return safeError(res, 500, 'Failed to fetch loyalty boosts');
+    const totalBoost = (data || []).reduce((sum, b) => sum + (b.xp_boost_percent || 0), 0);
+    res.json({ boosts: data || [], totalXpBoostPercent: totalBoost });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/gamification/loyalty-boost/tiers', async (req, res) => {
+  res.json({
+    tiers: [
+      { minStake: 100, maxStake: 499, boostPercent: 5, label: 'SUPPORTER' },
+      { minStake: 500, maxStake: 999, boostPercent: 10, label: 'BELIEVER' },
+      { minStake: 1000, maxStake: 4999, boostPercent: 15, label: 'ADVOCATE' },
+      { minStake: 5000, maxStake: 9999, boostPercent: 30, label: 'CHAMPION' },
+      { minStake: 10000, maxStake: null, boostPercent: 50, label: 'PHANTOM TIER' },
+    ],
+    eligibleBrands: ['Clay & Cloud', 'Little Nonya']
+  });
 });
 
 // ─── AGENTS ───────────────────────────────────────────────
@@ -1364,8 +1500,7 @@ setInterval(async () => {
       .select('id').eq('is_flash_mission', true).eq('status', 'active')
       .lt('flash_expires_at', new Date().toISOString());
     if (expiredFlash && expiredFlash.length > 0) {
-      await supabase.from('missions').update({ status: 'expired' })
-        .in('id', expiredFlash.map(m => m.id));
+      await supabase.from('missions').update({ status: 'expired' }).in('id', expiredFlash.map(m => m.id));
       logger.info({ message: `Expired ${expiredFlash.length} flash missions` });
     }
   } catch (err) {
@@ -1383,4 +1518,5 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
+
 
