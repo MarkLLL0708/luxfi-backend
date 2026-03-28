@@ -24,13 +24,13 @@ jobs:
     needs: [lint]
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Wait for Railway to deploy
+      - name: Wait for Render to deploy
         run: sleep 180
 
       - name: Check health endpoint
         run: |
           for i in 1 2 3 4 5 6 7 8 9 10; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://luxfi-backend-production.up.railway.app/health || echo "000")
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://luxfi-backend-lvr6.onrender.com/api/v1/health || echo "000")
             echo "Attempt $i - Status: $STATUS"
             if [ "$STATUS" = "200" ]; then
               echo "Health check passed"
@@ -38,5 +38,5 @@ jobs:
             fi
             sleep 30
           done
-          echo "Health check timed out - Railway may still be deploying"
+          echo "Health check timed out"
           exit 0
