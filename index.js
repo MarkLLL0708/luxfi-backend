@@ -396,10 +396,7 @@ v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
 // ─── BRAND INTELLIGENCE ───────────────────────────────────
 v1.get('/intelligence/brands', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('brand_intelligence')
-      .select('*')
-      .order('health_score', { ascending: false });
+    const { data, error } = await supabase.from('brand_intelligence').select('*').order('health_score', { ascending: false });
     if (error) return safeError(res, 500, 'Failed to fetch brand intelligence');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -407,11 +404,7 @@ v1.get('/intelligence/brands', async (req, res) => {
 
 v1.get('/intelligence/brands/luxfi', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('brand_intelligence')
-      .select('*')
-      .eq('is_luxfi_brand', true)
-      .order('health_score', { ascending: false });
+    const { data, error } = await supabase.from('brand_intelligence').select('*').eq('is_luxfi_brand', true).order('health_score', { ascending: false });
     if (error) return safeError(res, 500, 'Failed to fetch LUXFI brands');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -419,11 +412,7 @@ v1.get('/intelligence/brands/luxfi', async (req, res) => {
 
 v1.get('/intelligence/brands/competitors', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('brand_intelligence')
-      .select('*')
-      .eq('is_luxfi_brand', false)
-      .order('health_score', { ascending: false });
+    const { data, error } = await supabase.from('brand_intelligence').select('*').eq('is_luxfi_brand', false).order('health_score', { ascending: false });
     if (error) return safeError(res, 500, 'Failed to fetch competitors');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -431,12 +420,7 @@ v1.get('/intelligence/brands/competitors', async (req, res) => {
 
 v1.get('/intelligence/market', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('market_intelligence')
-      .select('*')
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .single();
+    const { data, error } = await supabase.from('market_intelligence').select('*').order('updated_at', { ascending: false }).limit(1).single();
     if (error) return safeError(res, 500, 'Failed to fetch market intelligence');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -739,12 +723,13 @@ v1.put('/marketplace/:id/cancel', authenticateToken, async (req, res) => {
 // ─── MISSIONS ─────────────────────────────────────────────
 v1.get('/missions', async (req, res) => {
   try {
-    const { city, mission_type, difficulty } = sanitize(req.query);
+    const { city, mission_type, difficulty, is_competitor_mission } = sanitize(req.query);
     let query = supabase.from('missions').select('*').eq('status', 'active')
       .gt('deadline', new Date().toISOString()).order('created_at', { ascending: false });
     if (city) query = query.eq('city', city);
     if (mission_type) query = query.eq('mission_type', mission_type);
     if (difficulty) query = query.eq('difficulty', difficulty);
+    if (is_competitor_mission !== undefined) query = query.eq('is_competitor_mission', is_competitor_mission === 'true');
     const { data, error } = await query;
     if (error) return safeError(res, 500, 'Failed to fetch missions');
     res.json(data);
@@ -1076,6 +1061,48 @@ v1.post('/missions/rewards/distribute', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── NOTIFICATIONS ────────────────────────────────────────
+v1.get('/notifications/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('notifications').select('*')
+      .eq('wallet_address', wallet).order('created_at', { ascending: false }).limit(20);
+    if (error) return safeError(res, 500, 'Failed to fetch notifications');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.put('/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const id = sanitize(req.params.id);
+    const { data, error } = await supabase.from('notifications').update({ read: true })
+      .eq('id', id).eq('wallet_address', req.user.walletAddress).select().single();
+    if (error) return safeError(res, 500, 'Failed to mark notification as read');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.put('/notifications/read-all/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    await supabase.from('notifications').update({ read: true }).eq('wallet_address', wallet).eq('read', false);
+    res.json({ success: true });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/notifications/:wallet/unread-count', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { count } = await supabase.from('notifications').select('*', { count: 'exact', head: true })
+      .eq('wallet_address', wallet).eq('read', false);
+    res.json({ unread: count ?? 0 });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── AI MISSION GENERATOR ─────────────────────────────────
 v1.post('/ai/generate-mission', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -1099,6 +1126,7 @@ Return ONLY JSON: {"codename": "OPERATION NAME", "briefing": "3 sentences.", "re
   }
 });
 
+// ─── ADMIN ────────────────────────────────────────────────
 v1.get('/admin/audit-logs', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -1149,6 +1177,7 @@ v1.get('/admin/anomalies', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── SCHEDULED JOBS ───────────────────────────────────────
 setInterval(async () => {
   try {
     await supabase.rpc('cleanup_expired_nonces');
@@ -1179,5 +1208,10 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
+```
 
+---
 
+Commit message:
+```
+feat: add notification endpoints for mission approvals and rewards
