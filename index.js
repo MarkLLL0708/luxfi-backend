@@ -190,6 +190,7 @@ app.use(helmet({ contentSecurityPolicy: true, crossOriginEmbedderPolicy: true })
 const allowedOrigins = [
   'https://luxfivault.netlify.app',
   'https://equine-legacy-vault.lovable.app',
+  'https://luxfi-backend-lvr6.onrender.com',
 ];
 
 app.use(cors({
@@ -376,7 +377,6 @@ app.get('/metrics', async (req, res) => {
   res.end(await promClient.register.metrics());
 });
 
-// ─── MARKET DATA ─────────────────────────────────────────
 v1.get('/market/bnb-price', async (req, res) => {
   try { res.json(await getBNBPrice()); }
   catch { return safeError(res, 500, 'Failed to fetch BNB price'); }
@@ -392,7 +392,6 @@ v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
   } catch { return safeError(res, 500, 'Failed to fetch brand market data'); }
 });
 
-// ─── AUTH ─────────────────────────────────────────────────
 v1.post('/auth/nonce', authLimiter, async (req, res) => {
   const { walletAddress } = sanitize(req.body);
   if (!walletAddress) return safeError(res, 400, 'walletAddress required');
@@ -434,7 +433,6 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   } catch { return safeError(res, 500, 'Authentication failed'); }
 });
 
-// ─── BRANDS ───────────────────────────────────────────────
 v1.get('/brands', async (req, res) => {
   try {
     const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
@@ -486,7 +484,6 @@ v1.put('/brands/:id', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── USERS ────────────────────────────────────────────────
 v1.get('/users/:wallet', authenticateToken, async (req, res) => {
   try {
     const wallet = sanitize(req.params.wallet);
@@ -512,7 +509,6 @@ v1.put('/users/:id/kyc', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── TRANSACTIONS ─────────────────────────────────────────
 v1.get('/transactions', authenticateToken, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 0;
@@ -555,7 +551,6 @@ v1.post('/transactions', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── REWARDS ──────────────────────────────────────────────
 v1.get('/rewards/pools', async (req, res) => {
   try {
     const { data, error } = await supabase.from('reward_pools').select('*, brands(name)').eq('status', 'active');
@@ -588,7 +583,6 @@ v1.post('/rewards/claim', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── GOVERNANCE ───────────────────────────────────────────
 v1.get('/governance', async (req, res) => {
   try {
     const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').order('created_at', { ascending: false });
@@ -630,7 +624,6 @@ v1.post('/governance/vote', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── MARKETPLACE ──────────────────────────────────────────
 v1.get('/marketplace', async (req, res) => {
   try {
     const { data, error } = await supabase.from('marketplace_listings').select('*, brands(name)').eq('status', 'active');
@@ -686,7 +679,6 @@ v1.put('/marketplace/:id/cancel', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── MISSIONS ─────────────────────────────────────────────
 v1.get('/missions', async (req, res) => {
   try {
     const { city, mission_type, difficulty } = sanitize(req.query);
@@ -780,7 +772,6 @@ v1.post('/missions/claims/:claimId/submit', authenticateToken, missionSubmitLimi
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── AI MISSION VERIFICATION ──────────────────────────────
 v1.post('/missions/claims/:claimId/ai-verify', authenticateToken, missionVerifyLimiter, async (req, res) => {
   try {
     const claimId = sanitize(req.params.claimId);
@@ -880,7 +871,6 @@ v1.get('/missions/agent/:wallet', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── NEW: AGENT REGISTRATION ──────────────────────────────
 v1.post('/agents/register', authenticateToken, async (req, res) => {
   try {
     const { codename } = sanitize(req.body);
@@ -893,18 +883,11 @@ v1.post('/agents/register', authenticateToken, async (req, res) => {
       .select('id').eq('codename', codename).single();
     if (codenameTaken) return safeError(res, 400, 'Codename already taken');
     const { data, error } = await supabase.from('agent_profiles').insert({
-      wallet_address: req.user.walletAddress,
-      codename: codename,
-      xp: 0,
-      missions_completed: 0,
-      missions_attempted: 0,
-      reputation_score: 500,
-      clearance_level: 'ROOKIE',
-      badges_earned: [],
-      total_earned: 0,
-      total_staked: 0,
-      is_blacklisted: false,
-      joined_at: new Date().toISOString()
+      wallet_address: req.user.walletAddress, codename,
+      xp: 0, missions_completed: 0, missions_attempted: 0,
+      reputation_score: 500, clearance_level: 'ROOKIE',
+      badges_earned: [], total_earned: 0, total_staked: 0,
+      is_blacklisted: false, joined_at: new Date().toISOString()
     }).select().single();
     if (error) return safeError(res, 500, 'Failed to register agent');
     await auditLog('AGENT_REGISTERED', req.user.walletAddress, { codename }, 'INFO');
@@ -926,13 +909,13 @@ v1.get('/agents/:wallet/badges', authenticateToken, async (req, res) => {
   try {
     const wallet = sanitize(req.params.wallet);
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
-    const { data, error } = await supabase.from('nft_badges').select('*').eq('wallet_address', wallet).order('minted_at', { ascending: false });
+    const { data, error } = await supabase.from('nft_badges').select('*').eq('wallet_address', wallet)
+      .order('minted_at', { ascending: false });
     if (error) return safeError(res, 500, 'Failed to fetch badges');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── NEW: RWA PURCHASE RECORDING ─────────────────────────
 v1.post('/rwa/purchase', authenticateToken, async (req, res) => {
   try {
     const { brandId, luxfiAmount, bnbPaid, txHash } = sanitize(req.body);
@@ -948,12 +931,9 @@ v1.post('/rwa/purchase', authenticateToken, async (req, res) => {
     const suspicious = await transactionMonitor(req.user.walletAddress, 'RWA_PURCHASE');
     if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
     const { data, error } = await supabase.from('rwa_purchases').insert({
-      wallet_address: req.user.walletAddress,
-      brand_id: brandId,
-      luxfi_amount: parseFloat(luxfiAmount),
-      bnb_paid: parseFloat(bnbPaid),
-      tx_hash: txHash,
-      status: 'confirmed'
+      wallet_address: req.user.walletAddress, brand_id: brandId,
+      luxfi_amount: parseFloat(luxfiAmount), bnb_paid: parseFloat(bnbPaid),
+      tx_hash: txHash, status: 'confirmed'
     }).select().single();
     if (error) return safeError(res, 500, 'Failed to record RWA purchase');
     await auditLog('RWA_PURCHASE', req.user.walletAddress, { brandId, luxfiAmount, bnbPaid, txHash }, 'INFO');
@@ -972,7 +952,6 @@ v1.get('/rwa/purchases/:wallet', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── NEW: STAKING ─────────────────────────────────────────
 v1.post('/staking/stake', authenticateToken, async (req, res) => {
   try {
     const { luxfiAmount, txHash } = sanitize(req.body);
@@ -985,10 +964,8 @@ v1.post('/staking/stake', authenticateToken, async (req, res) => {
       return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
     }
     const { data, error } = await supabase.from('staking_positions').insert({
-      wallet_address: req.user.walletAddress,
-      luxfi_staked: parseFloat(luxfiAmount),
-      stake_tx_hash: txHash,
-      status: 'active'
+      wallet_address: req.user.walletAddress, luxfi_staked: parseFloat(luxfiAmount),
+      stake_tx_hash: txHash, status: 'active'
     }).select().single();
     if (error) return safeError(res, 500, 'Failed to record staking position');
     await auditLog('STAKE', req.user.walletAddress, { luxfiAmount, txHash }, 'INFO');
@@ -1024,7 +1001,6 @@ v1.get('/staking/:wallet', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── NEW: MISSION REWARD DISTRIBUTION ────────────────────
 v1.post('/missions/rewards/distribute', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -1039,26 +1015,22 @@ v1.post('/missions/rewards/distribute', async (req, res) => {
       wallet_address: claim.agent_wallet,
       badge_tier: claim.nft_badge_tier || 1,
       badge_name: ['Bronze', 'Gold', 'Diamond'][Math.min((claim.nft_badge_tier || 1) - 1, 2)],
-      mission_id: claim.mission_id,
-      claim_id: claimId
+      mission_id: claim.mission_id, claim_id: claimId
     });
-    await supabase.from('mission_claims').update({ reward_status: 'distributed', distributed_at: new Date().toISOString() }).eq('id', claimId);
+    await supabase.from('mission_claims').update({
+      reward_status: 'distributed', distributed_at: new Date().toISOString()
+    }).eq('id', claimId);
     await auditLog('REWARD_DISTRIBUTED', claim.agent_wallet, {
       claimId, luxfi: claim.luxfi_reward_amount, bnb: claim.bnb_reward_amount, badge: claim.nft_badge_tier
     }, 'INFO');
     res.json({
-      success: true,
-      claimId,
-      agentWallet: claim.agent_wallet,
-      luxfiRewarded: claim.luxfi_reward_amount,
-      bnbRewarded: claim.bnb_reward_amount,
-      badgeTier: claim.nft_badge_tier,
-      note: 'On-chain distribution pending contract deployment'
+      success: true, claimId, agentWallet: claim.agent_wallet,
+      luxfiRewarded: claim.luxfi_reward_amount, bnbRewarded: claim.bnb_reward_amount,
+      badgeTier: claim.nft_badge_tier, note: 'On-chain distribution pending contract deployment'
     });
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── AI MISSION GENERATOR ─────────────────────────────────
 v1.post('/ai/generate-mission', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -1087,7 +1059,6 @@ Return ONLY a JSON object with no markdown, no backticks:
   }
 });
 
-// ─── ADMIN ────────────────────────────────────────────────
 v1.get('/admin/audit-logs', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -1102,7 +1073,8 @@ v1.get('/admin/suspicious', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
-    const { data, error } = await supabase.from('audit_logs').select('*').eq('severity', 'HIGH').order('created_at', { ascending: false }).limit(50);
+    const { data, error } = await supabase.from('audit_logs').select('*').eq('severity', 'HIGH')
+      .order('created_at', { ascending: false }).limit(50);
     if (error) return safeError(res, 500, 'Failed to fetch suspicious activity');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -1137,7 +1109,6 @@ v1.get('/admin/anomalies', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// ─── SCHEDULED JOBS ───────────────────────────────────────
 setInterval(async () => {
   try {
     await supabase.rpc('cleanup_expired_nonces');
@@ -1158,17 +1129,13 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000);
 
-// ─── 404 HANDLER ─────────────────────────────────────────
 app.use((req, res) => safeError(res, 404, 'Route not found'));
 
-// ─── GLOBAL ERROR HANDLER ────────────────────────────────
 app.use((err, req, res, next) => {
   Sentry.captureException(err);
   logger.error({ error: err.message, stack: err.stack });
   safeError(res, 500, 'Internal server error');
 });
 
-// ─── START ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
-
