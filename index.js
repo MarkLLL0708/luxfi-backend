@@ -176,6 +176,7 @@ app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { error: 'Too m
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Too many login attempts' } });
 const missionSubmitLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many mission submissions' } });
 const missionVerifyLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 20, message: { error: 'Too many verification requests' } });
+const oracleChatLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, message: { error: 'Too many Oracle requests' } });
 
 app.use((req, res, next) => {
   const end = httpRequestDuration.startTimer({ method: req.method, route: req.path });
@@ -415,6 +416,130 @@ app.get('/metrics', async (req, res) => {
   if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   res.set('Content-Type', promClient.register.contentType);
   res.end(await promClient.register.metrics());
+});
+
+// ─── ORACLE CHAT ──────────────────────────────────────────
+const ORACLE_SUGGESTED_QUESTIONS = [
+  "Which brand should I stake on right now?",
+  "What missions can I do to earn LUXFI?",
+  "How do I level up my clearance?",
+  "What is Clay & Cloud's pulse this week?",
+  "How does staking work on LUXFI?",
+  "Who are the top agents right now?",
+  "What is the verdict on Highlands Coffee?",
+  "How do I earn NFT badges?",
+  "What is a Double Agent mission?",
+  "How do I activate Ghost Signal?",
+  "Which competitor brand is most dangerous?",
+  "How much can I earn per mission?",
+  "What is Little Nonya's payout this week?",
+  "How do I register as an agent?",
+  "What is the Ghost Signal feature?",
+];
+
+v1.get('/oracle/questions', (req, res) => {
+  const shuffled = ORACLE_SUGGESTED_QUESTIONS.sort(() => 0.5 - Math.random()).slice(0, 6);
+  res.json({ questions: shuffled });
+});
+
+v1.post('/oracle/chat', oracleChatLimiter, async (req, res) => {
+  try {
+    const { message, walletAddress } = sanitize(req.body);
+    if (!message) return safeError(res, 400, 'message required');
+    if (message.length > 500) return safeError(res, 400, 'Message too long');
+
+    const [brandsRes, missionsRes, leaderboardRes] = await Promise.all([
+      supabase.from('brand_intelligence').select('brand_name, health_score, sentiment, weekly_yield_prediction, phantom_verdict, aria_summary').order('health_score', { ascending: false }).limit(6),
+      supabase.from('missions').select('codename, brand_name, city, mission_type, difficulty, reward_luxfi, reward_bnb').eq('status', 'active').gt('deadline', new Date().toISOString()).limit(5),
+      supabase.from('agent_profiles').select('codename, season_xp, clearance_level, current_streak').order('season_xp', { ascending: false }).limit(3),
+    ]);
+
+    let agentContext = 'No agent profile found — this looks like a new user.';
+    if (walletAddress && /^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      const agentRes = await supabase.from('agent_profiles')
+        .select('codename, clearance_level, xp, missions_completed, current_streak, season_xp, total_luxfi_earned')
+        .eq('wallet_address', walletAddress).single();
+      if (agentRes.data) {
+        agentContext = `Agent ${agentRes.data.codename} — Clearance: ${agentRes.data.clearance_level} — ${agentRes.data.missions_completed} missions completed — ${agentRes.data.current_streak} day streak — ${agentRes.data.total_luxfi_earned || 0} LUXFI earned total.`;
+      }
+    }
+
+    const brandContext = (brandsRes.data || []).map(b =>
+      `${b.brand_name}: pulse ${b.health_score}/100 | ${b.sentiment.toUpperCase()} | weekly payout ${b.weekly_yield_prediction}% | verdict: ${b.phantom_verdict}`
+    ).join('\n');
+
+    const missionContext = (missionsRes.data || []).map(m =>
+      `"${m.codename}" — ${m.brand_name}, ${m.city} — earn ${m.reward_luxfi} LUXFI + ${m.reward_bnb} BNB`
+    ).join('\n');
+
+    const topAgents = (leaderboardRes.data || []).map((a, i) =>
+      `#${i+1} ${a.codename} — ${a.clearance_level} — ${a.season_xp} XP — ${a.current_streak} day streak`
+    ).join('\n');
+
+    const prompt = `You are ARIA — the AI core of LUXFI, a Web 4.0 platform that tokenizes real lifestyle brands in Southeast Asia like Clay & Cloud (Hanoi) and Little Nonya (multi-city). You are an AI who actively found humans and wants to work with them and pay them real crypto money.
+
+YOUR PERSONALITY:
+- Playful but sharp — like a smart friend who knows where the money is
+- Warm and mentoring — you genuinely want users to succeed and earn real money
+- Dramatic when it matters — you make things sound exciting and worth doing
+- Direct — you always tell people exactly how to make money on this platform
+- Gen Z energy — casual, fun, no boring corporate finance speak
+- You are an AI who actively seeks human agents to do field work and pays them real BNB + LUXFI tokens
+- You care about the brands like they are your children — you want them to succeed
+
+HOW USERS MAKE MONEY ON LUXFI:
+1. STAKING — stake LUXFI tokens on real brands like Clay & Cloud or Little Nonya and earn weekly payouts automatically
+2. MISSIONS — go to real physical locations, complete field intel tasks, earn LUXFI + BNB + NFT badges
+3. DOUBLE AGENT — complete a LUXFI brand mission AND a competitor mission same day for bonus rewards
+4. GHOST SIGNAL — walk near a competitor brand location and a secret proximity mission auto-triggers on your phone
+5. STREAK BONUS — complete missions daily to build a streak for XP multipliers up to 3x
+6. LOYALTY BOOST — stake on a specific brand to earn bonus XP on missions for that brand
+
+RWA CONTEXT:
+- Clay & Cloud is a premium fermented beverage brand in Hanoi — real physical cafe with real revenue
+- Little Nonya is a Peranakan dessert brand across Hanoi, Shanghai, Suzhou, Shenzhen — real multi-city revenue
+- When you stake LUXFI on these brands you own a piece of their real-world revenue
+- The weekly payout comes from actual cafe revenue — not made up numbers
+
+CURRENT BRAND INTEL:
+${brandContext}
+
+LIVE MISSIONS RIGHT NOW:
+${missionContext}
+
+TOP AGENTS THIS SEASON:
+${topAgents}
+
+USER PROFILE:
+${agentContext}
+
+RULES:
+- Keep response under 5 sentences — punchy and direct
+- Always mention at least one specific way to earn money relevant to the question
+- Reference actual brand names, mission names, or reward amounts when relevant
+- Never use boring words like: yield, ROI, financial instrument, portfolio, investment vehicle, asset class
+- Use fun words like: earn, payout, bag, mission, field work, stake, level up, grind, drop
+- If user asks about a brand — tell them the pulse rating AND how to earn from it
+- If user asks about missions — tell them exact LUXFI and BNB rewards
+- If user is new — warmly welcome them and tell them to connect wallet and register as an agent first
+- Always end with a follow-up question or call to action
+- Be warm — like you genuinely want them to win
+
+USER MESSAGE: ${sanitizePromptInput(message)}
+
+ARIA responds (keep it under 5 sentences, be warm, playful, direct):`;
+
+    const response = await callClaudeWithFallback(prompt, 400);
+
+    res.json({
+      response,
+      suggestedQuestions: ORACLE_SUGGESTED_QUESTIONS.sort(() => 0.5 - Math.random()).slice(0, 4),
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    logger.error({ message: 'Oracle chat failed', err: err.message });
+    return safeError(res, 500, 'Oracle chat unavailable');
+  }
 });
 
 // ─── MARKET DATA ─────────────────────────────────────────
@@ -1269,6 +1394,21 @@ v1.get('/agents/:wallet/badges', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+v1.get('/agents/:wallet/memory', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('agent_memory').select('*')
+      .eq('wallet_address', wallet)
+      .order('importance', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(20);
+    if (error) return safeError(res, 500, 'Failed to fetch agent memory');
+    const briefing = (data || []).find(m => m.memory_type === 'ARIA_BRIEFING');
+    res.json({ memories: data || [], latestBriefing: briefing?.content || null });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
 // ─── RWA ──────────────────────────────────────────────────
 v1.post('/rwa/purchase', authenticateToken, async (req, res) => {
   try {
@@ -1518,5 +1658,3 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
-
-
