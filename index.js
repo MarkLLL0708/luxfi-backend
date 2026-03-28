@@ -136,41 +136,6 @@ const sanitizePromptInput = (str) => {
     .substring(0, 200);
 };
 
-const getBrandMarketData = async (brandName, city) => {
-  const cacheKey = `brand_${brandName}_${city}`;
-  const cached = marketDataCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < MARKET_CACHE_TTL) return cached.data;
-  try {
-    const safeBrand = sanitizePromptInput(brandName);
-    const safeCity = sanitizePromptInput(city);
-    const data = await callClaudeWithFallback(
-      `You are a market analyst for LUXFI platform. Provide a brief market intelligence report for:
-Brand: ${safeBrand}
-Location: ${safeCity}
-Respond ONLY in JSON:
-{
-  "sentiment": "bullish|neutral|bearish",
-  "growthPotential": 7,
-  "riskLevel": "low|medium|high",
-  "keyFactors": ["factor1", "factor2"],
-  "confidence": "low|medium|high",
-  "dataSource": "ai_analysis",
-  "disclaimer": "AI-generated analysis, not financial advice"
-}`, 500
-    );
-    const parsed = JSON.parse(data);
-    marketDataCache.set(cacheKey, { data: parsed, timestamp: Date.now() });
-    return parsed;
-  } catch (err) {
-    logger.error({ message: 'Brand market data failed', err: err.message });
-    return {
-      sentiment: 'neutral', growthPotential: 5, riskLevel: 'medium',
-      keyFactors: ['Data unavailable'], confidence: 'low',
-      dataSource: 'fallback', disclaimer: 'AI-generated analysis, not financial advice'
-    };
-  }
-};
-
 const BLOCKED_COUNTRIES = ['US', 'IR', 'KP', 'CU', 'SY'];
 
 const checkJurisdiction = async (req, res, next) => {
@@ -345,6 +310,78 @@ const auditLog = async (action, walletAddress, details, severity = 'INFO') => {
   } catch (err) { logger.error({ message: 'Audit log failed', err: err.message }); }
 };
 
+// ─── GAMIFICATION HELPERS ─────────────────────────────────
+const CLEARANCE_LEVELS = [
+  { level: 'ROOKIE', min: 0, max: 5 },
+  { level: 'OPERATIVE', min: 6, max: 15 },
+  { level: 'SPECIALIST', min: 16, max: 30 },
+  { level: 'FIELD AGENT', min: 31, max: 50 },
+  { level: 'PHANTOM', min: 51, max: Infinity },
+];
+
+const getClearanceLevel = (missionsCompleted) => {
+  const level = CLEARANCE_LEVELS.find(l => missionsCompleted >= l.min && missionsCompleted <= l.max);
+  return level ? level.level : 'ROOKIE';
+};
+
+const XP_REWARDS = { 1: 100, 2: 250, 3: 500 };
+const STREAK_MULTIPLIERS = { 3: 1.25, 7: 1.5, 14: 2.0, 30: 3.0 };
+
+const getStreakMultiplier = (streak) => {
+  if (streak >= 30) return STREAK_MULTIPLIERS[30];
+  if (streak >= 14) return STREAK_MULTIPLIERS[14];
+  if (streak >= 7) return STREAK_MULTIPLIERS[7];
+  if (streak >= 3) return STREAK_MULTIPLIERS[3];
+  return 1.0;
+};
+
+const haversineDistance = (lat1, lng1, lat2, lng2) => {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng/2) * Math.sin(dLng/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+};
+
+const updateAgentProgress = async (walletAddress, difficulty, luxfiEarned) => {
+  try {
+    const { data: agent } = await supabase.from('agent_profiles').select('*').eq('wallet_address', walletAddress).single();
+    if (!agent) return;
+    const today = new Date().toISOString().split('T')[0];
+    const lastDate = agent.last_mission_date;
+    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    let newStreak = 1;
+    if (lastDate === yesterday) newStreak = (agent.current_streak || 0) + 1;
+    else if (lastDate === today) newStreak = agent.current_streak || 1;
+    const xpGained = XP_REWARDS[difficulty] || 100;
+    const multiplier = getStreakMultiplier(newStreak);
+    const finalXP = Math.floor(xpGained * multiplier);
+    const newMissionsCompleted = (agent.missions_completed || 0) + 1;
+    const newClearance = getClearanceLevel(newMissionsCompleted);
+    await supabase.from('agent_profiles').update({
+      xp: (agent.xp || 0) + finalXP,
+      season_xp: (agent.season_xp || 0) + finalXP,
+      missions_completed: newMissionsCompleted,
+      current_streak: newStreak,
+      longest_streak: Math.max(agent.longest_streak || 0, newStreak),
+      last_mission_date: today,
+      clearance_level: newClearance,
+      total_luxfi_earned: (agent.total_luxfi_earned || 0) + luxfiEarned
+    }).eq('wallet_address', walletAddress);
+    await supabase.from('season_rankings').upsert({
+      wallet_address: walletAddress,
+      codename: agent.codename,
+      season_xp: (agent.season_xp || 0) + finalXP,
+      missions_completed: newMissionsCompleted,
+    }, { onConflict: 'wallet_address' });
+    return { xpGained: finalXP, multiplier, newStreak, newClearance };
+  } catch (err) {
+    logger.error({ message: 'Failed to update agent progress', err: err.message });
+  }
+};
+
 app.use((req, res, next) => {
   req.requestId = generateRequestId();
   res.setHeader('X-Request-ID', req.requestId);
@@ -381,16 +418,6 @@ app.get('/metrics', async (req, res) => {
 v1.get('/market/bnb-price', async (req, res) => {
   try { res.json(await getBNBPrice()); }
   catch { return safeError(res, 500, 'Failed to fetch BNB price'); }
-});
-
-v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
-  try {
-    const brandId = sanitize(req.params.brandId);
-    const { data: brand } = await supabase.from('brands').select('name, city').eq('id', brandId).single();
-    if (!brand) return safeError(res, 404, 'Brand not found');
-    const marketData = await getBrandMarketData(brand.name, brand.city);
-    res.json({ brand: brand.name, city: brand.city, ...marketData });
-  } catch { return safeError(res, 500, 'Failed to fetch brand market data'); }
 });
 
 // ─── BRAND INTELLIGENCE ───────────────────────────────────
@@ -736,9 +763,21 @@ v1.get('/missions', async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+v1.get('/missions/flash', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('missions').select('*')
+      .eq('status', 'active').eq('is_flash_mission', true)
+      .gt('flash_expires_at', new Date().toISOString())
+      .order('flash_expires_at', { ascending: true });
+    if (error) return safeError(res, 500, 'Failed to fetch flash missions');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
 v1.get('/missions/leaderboard', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('leaderboard_weekly').select('*').limit(20);
+    const { data, error } = await supabase.from('agent_profiles').select('codename, wallet_address, xp, missions_completed, clearance_level, current_streak, season_xp')
+      .order('season_xp', { ascending: false }).limit(20);
     if (error) return safeError(res, 500, 'Failed to fetch leaderboard');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
@@ -763,6 +802,31 @@ v1.post('/missions', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+v1.post('/missions/nearby', authenticateToken, async (req, res) => {
+  try {
+    const { lat, lng } = sanitize(req.body);
+    if (!lat || !lng) return safeError(res, 400, 'lat and lng required');
+    const userLat = parseFloat(lat);
+    const userLng = parseFloat(lng);
+    if (isNaN(userLat) || isNaN(userLng)) return safeError(res, 400, 'Invalid coordinates');
+    const { data: locations } = await supabase.from('brand_locations').select('*').eq('active', true);
+    const nearby = [];
+    for (const loc of locations || []) {
+      const distance = haversineDistance(userLat, userLng, parseFloat(loc.lat), parseFloat(loc.lng));
+      if (distance <= loc.radius_meters) {
+        nearby.push({ ...loc, distance: Math.round(distance) });
+      }
+    }
+    if (nearby.length === 0) return res.json({ nearby: [], missions: [] });
+    const brandNames = [...new Set(nearby.map(l => l.brand_name))];
+    const { data: missions } = await supabase.from('missions').select('*')
+      .eq('status', 'active').gt('deadline', new Date().toISOString())
+      .in('brand_name', brandNames);
+    await auditLog('GHOST_SIGNAL', req.user.walletAddress, { nearby: nearby.length, brands: brandNames }, 'INFO');
+    res.json({ nearby, missions: missions || [], ghostSignal: nearby.length > 0 });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
 v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
   try {
     const id = sanitize(req.params.id);
@@ -779,6 +843,16 @@ v1.post('/missions/:id/claim', authenticateToken, async (req, res) => {
     const { data: mission } = await supabase.from('missions').select('*').eq('id', id).single();
     if (!mission || mission.status !== 'active') return safeError(res, 400, 'Mission not available');
     if (new Date(mission.deadline) < new Date()) return safeError(res, 400, 'Mission deadline passed');
+    if (mission.is_flash_mission && mission.flash_expires_at && new Date(mission.flash_expires_at) < new Date()) {
+      return safeError(res, 400, 'Flash mission expired');
+    }
+    const { data: agent } = await supabase.from('agent_profiles').select('clearance_level').eq('wallet_address', walletAddress).single();
+    if (mission.required_clearance && agent) {
+      const levels = ['ROOKIE', 'OPERATIVE', 'SPECIALIST', 'FIELD AGENT', 'PHANTOM'];
+      const agentLevel = levels.indexOf(agent.clearance_level);
+      const requiredLevel = levels.indexOf(mission.required_clearance);
+      if (agentLevel < requiredLevel) return safeError(res, 403, `Clearance level ${mission.required_clearance} required`);
+    }
     const { data, error } = await supabase.from('mission_claims').insert({
       mission_id: id, agent_wallet: walletAddress,
       stake_tx_hash: stakeTxHash, stake_amount_bnb: mission.stake_required_bnb
@@ -795,7 +869,6 @@ v1.post('/missions/claims/:claimId/submit', authenticateToken, missionSubmitLimi
     const { intel_text, intel_photos, intel_video_url, gps_lat, gps_lng } = sanitize(req.body);
     if (!intel_text) return safeError(res, 400, 'intel_text required');
     if (intel_text.length > 5000) return safeError(res, 400, 'intel_text exceeds maximum length');
-    if (intel_video_url && intel_video_url.length > 500) return safeError(res, 400, 'Video URL too long');
     let gpsVerified = false, validLat = null, validLng = null;
     if (gps_lat !== undefined && gps_lng !== undefined) {
       const lat = parseFloat(gps_lat), lng = parseFloat(gps_lng);
@@ -818,7 +891,6 @@ v1.post('/missions/claims/:claimId/submit', authenticateToken, missionSubmitLimi
 v1.post('/missions/claims/:claimId/ai-verify', authenticateToken, missionVerifyLimiter, async (req, res) => {
   try {
     const claimId = sanitize(req.params.claimId);
-    if (!claimId) return safeError(res, 400, 'claimId required');
     const { data: claim, error: claimError } = await supabase.from('mission_claims')
       .select('*, missions(*)').eq('id', claimId).single();
     if (claimError || !claim) return safeError(res, 404, 'Claim not found');
@@ -849,29 +921,21 @@ Score 0-100. Approve if score >= 70.`;
     }).eq('id', claimId);
     if (approved) {
       const difficulty = mission?.difficulty || 1;
-      const rewardMap = { 1: { luxfi: 100, bnb: 0.001, badge: 'Bronze' }, 2: { luxfi: 500, bnb: 0.005, badge: 'Gold' }, 3: { luxfi: 2500, bnb: 0.025, badge: 'Diamond' } };
+      const rewardMap = { 1: { luxfi: 100, bnb: 0.001 }, 2: { luxfi: 500, bnb: 0.005 }, 3: { luxfi: 2500, bnb: 0.025 } };
       const reward = rewardMap[difficulty] || rewardMap[1];
+      const flashBonus = mission?.flash_bonus_luxfi || 0;
       await supabase.from('mission_claims').update({
-        luxfi_reward_amount: reward.luxfi, bnb_reward_amount: reward.bnb,
-        nft_badge_tier: difficulty, reward_status: 'pending_distribution'
+        luxfi_reward_amount: reward.luxfi + flashBonus,
+        bnb_reward_amount: reward.bnb,
+        nft_badge_tier: difficulty,
+        reward_status: 'pending_distribution'
       }).eq('id', claimId);
-      await auditLog('MISSION_AI_APPROVED', claim.agent_wallet, { claimId, score, reward }, 'INFO');
-    } else {
-      await auditLog('MISSION_AI_REJECTED', claim.agent_wallet, { claimId, score, reason: verification.reason }, 'WARN');
+      await updateAgentProgress(claim.agent_wallet, difficulty, reward.luxfi + flashBonus);
+      await auditLog('MISSION_AI_APPROVED', claim.agent_wallet, { claimId, score }, 'INFO');
     }
-    const diffIdx = Math.min((mission?.difficulty || 1) - 1, 2);
-    res.json({
-      claimId, score, approved, status: newStatus,
-      feedback: verification.feedback, reason: verification.reason,
-      reward: approved ? {
-        luxfi: `${[100, 500, 2500][diffIdx]} LUXFI`,
-        bnb: `${[0.001, 0.005, 0.025][diffIdx]} BNB`,
-        badge: ['Bronze', 'Gold', 'Diamond'][diffIdx]
-      } : null
-    });
+    res.json({ claimId, score, approved, status: newStatus, feedback: verification.feedback });
   } catch (err) {
     logger.error({ message: 'AI verification failed', err: err.message });
-    Sentry.captureException(err);
     return safeError(res, 500, 'AI verification failed');
   }
 });
@@ -881,8 +945,10 @@ v1.post('/missions/claims/:claimId/approve', async (req, res) => {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
     const claimId = sanitize(req.params.claimId);
-    const { error } = await supabase.rpc('approve_mission', { p_claim_id: claimId });
-    if (error) return safeError(res, 500, 'Failed to approve mission');
+    const { data: claim } = await supabase.from('mission_claims').select('*, missions(difficulty)').eq('id', claimId).single();
+    if (!claim) return safeError(res, 404, 'Claim not found');
+    await supabase.from('mission_claims').update({ status: 'approved' }).eq('id', claimId);
+    await updateAgentProgress(claim.agent_wallet, claim.missions?.difficulty || 1, claim.luxfi_reward_amount || 100);
     await auditLog('APPROVE_MISSION', 'admin', { claimId }, 'INFO');
     res.json({ success: true });
   } catch { safeError(res, 500, 'Server error'); }
@@ -901,20 +967,142 @@ v1.get('/missions/agent/:wallet', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── GAMIFICATION ─────────────────────────────────────────
+v1.get('/gamification/agent/:wallet', authenticateToken, async (req, res) => {
+  try {
+    const wallet = sanitize(req.params.wallet);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
+    const { data, error } = await supabase.from('agent_profiles').select('*').eq('wallet_address', wallet).single();
+    if (error) return safeError(res, 404, 'Agent not found');
+    const nextLevel = CLEARANCE_LEVELS.find(l => l.min > (data.missions_completed || 0));
+    const missionsToNextLevel = nextLevel ? nextLevel.min - (data.missions_completed || 0) : 0;
+    const streakMultiplier = getStreakMultiplier(data.current_streak || 0);
+    res.json({
+      ...data,
+      streakMultiplier,
+      missionsToNextLevel,
+      nextClearanceLevel: nextLevel?.level || 'MAX LEVEL'
+    });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/gamification/leaderboard', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('agent_profiles')
+      .select('codename, wallet_address, xp, season_xp, missions_completed, clearance_level, current_streak, longest_streak')
+      .order('season_xp', { ascending: false }).limit(50);
+    if (error) return safeError(res, 500, 'Failed to fetch leaderboard');
+    const ranked = (data || []).map((agent, index) => ({ ...agent, rank: index + 1 }));
+    res.json(ranked);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/gamification/seasons', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('leaderboard_seasons').select('*').order('season_number', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch seasons');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/gamification/seasons/current', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('leaderboard_seasons').select('*').eq('status', 'active').single();
+    if (error) return safeError(res, 404, 'No active season');
+    const { data: rankings } = await supabase.from('agent_profiles')
+      .select('codename, wallet_address, season_xp, missions_completed, clearance_level')
+      .order('season_xp', { ascending: false }).limit(10);
+    res.json({ season: data, topAgents: rankings || [] });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.post('/gamification/tribunal/vote', authenticateToken, async (req, res) => {
+  try {
+    const { brandName, vote } = sanitize(req.body);
+    if (!brandName || !vote) return safeError(res, 400, 'brandName and vote required');
+    const validVotes = ['ACQUIRE', 'MONITOR', 'THREAT'];
+    if (!validVotes.includes(vote)) return safeError(res, 400, 'Vote must be ACQUIRE, MONITOR, or THREAT');
+    const { data: existing } = await supabase.from('tribunal_votes').select('id')
+      .eq('brand_name', brandName).eq('wallet_address', req.user.walletAddress).single();
+    if (existing) return safeError(res, 400, 'Already voted on this brand');
+    const { data, error } = await supabase.from('tribunal_votes').insert({
+      brand_name: brandName, wallet_address: req.user.walletAddress, vote
+    }).select().single();
+    if (error) return safeError(res, 500, 'Failed to cast vote');
+    const { data: votes } = await supabase.from('tribunal_votes').select('vote').eq('brand_name', brandName);
+    const tally = { ACQUIRE: 0, MONITOR: 0, THREAT: 0 };
+    (votes || []).forEach(v => { if (tally[v.vote] !== undefined) tally[v.vote]++; });
+    const total = Object.values(tally).reduce((a, b) => a + b, 0);
+    if (total >= 10) {
+      const verdict = Object.entries(tally).sort((a, b) => b[1] - a[1])[0][0];
+      const verdictMap = { ACQUIRE: 'ACQUISITION TARGET', MONITOR: 'MONITORING', THREAT: 'THREAT DETECTED' };
+      await supabase.from('brand_intelligence').update({ phantom_verdict: verdictMap[verdict] }).eq('brand_name', brandName);
+      await auditLog('TRIBUNAL_VERDICT', req.user.walletAddress, { brandName, verdict, tally }, 'INFO');
+    }
+    await auditLog('TRIBUNAL_VOTE', req.user.walletAddress, { brandName, vote }, 'INFO');
+    res.json({ success: true, vote: data, tally, total });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/gamification/tribunal/:brandName', async (req, res) => {
+  try {
+    const brandName = sanitize(req.params.brandName);
+    const { data: votes } = await supabase.from('tribunal_votes').select('vote').eq('brand_name', brandName);
+    const tally = { ACQUIRE: 0, MONITOR: 0, THREAT: 0 };
+    (votes || []).forEach(v => { if (tally[v.vote] !== undefined) tally[v.vote]++; });
+    const total = Object.values(tally).reduce((a, b) => a + b, 0);
+    res.json({ brandName, tally, total, threshold: 10 });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.post('/gamification/flash-mission', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const { brandName, city, missionType, bonusLuxfi } = sanitize(req.body);
+    if (!brandName || !city) return safeError(res, 400, 'brandName and city required');
+    const flashExpiry = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    const deadline = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase.from('missions').insert({
+      codename: `FLASH — ${brandName.toUpperCase()} ${new Date().toLocaleTimeString()}`,
+      brand_name: brandName, city,
+      mission_type: missionType || 'LOCATION_SURVEILLANCE',
+      briefing: `URGENT. ARIA has detected unusual activity at ${brandName} in ${city}. First 3 agents to submit verified intel receive bonus rewards. Time is critical.`,
+      requirements: ['Photograph the location immediately', 'Report crowd density', 'Note any unusual activity', 'Submit within 2 hours'],
+      difficulty: 2,
+      reward_bnb: 0.005,
+      reward_luxfi: 500,
+      flash_bonus_luxfi: bonusLuxfi || 250,
+      stake_required_bnb: 0.001,
+      status: 'active',
+      is_flash_mission: true,
+      is_competitor_mission: true,
+      competitor_brand: brandName,
+      flash_expires_at: flashExpiry,
+      deadline,
+      max_agents: 3,
+      created_at: new Date().toISOString()
+    }).select().single();
+    if (error) return safeError(res, 500, 'Failed to create flash mission');
+    await auditLog('FLASH_MISSION_CREATED', 'admin', { brandName, city }, 'INFO');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── AGENTS ───────────────────────────────────────────────
 v1.post('/agents/register', authenticateToken, async (req, res) => {
   try {
     const { codename } = sanitize(req.body);
     if (!codename || codename.length < 3) return safeError(res, 400, 'Codename must be at least 3 characters');
     if (codename.length > 30) return safeError(res, 400, 'Codename too long');
-    const { data: existing } = await supabase.from('agent_profiles')
-      .select('id').eq('wallet_address', req.user.walletAddress).single();
+    const { data: existing } = await supabase.from('agent_profiles').select('id').eq('wallet_address', req.user.walletAddress).single();
     if (existing) return safeError(res, 400, 'Agent already registered');
-    const { data: codenameTaken } = await supabase.from('agent_profiles')
-      .select('id').eq('codename', codename).single();
+    const { data: codenameTaken } = await supabase.from('agent_profiles').select('id').eq('codename', codename).single();
     if (codenameTaken) return safeError(res, 400, 'Codename already taken');
     const { data, error } = await supabase.from('agent_profiles').insert({
       wallet_address: req.user.walletAddress, codename,
-      xp: 0, missions_completed: 0, missions_attempted: 0,
+      xp: 0, season_xp: 0, missions_completed: 0, missions_attempted: 0,
+      current_streak: 0, longest_streak: 0,
       reputation_score: 500, clearance_level: 'ROOKIE',
       badges_earned: [], total_earned: 0, total_staked: 0,
       is_blacklisted: false, joined_at: new Date().toISOString()
@@ -939,13 +1127,13 @@ v1.get('/agents/:wallet/badges', authenticateToken, async (req, res) => {
   try {
     const wallet = sanitize(req.params.wallet);
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
-    const { data, error } = await supabase.from('nft_badges').select('*').eq('wallet_address', wallet)
-      .order('minted_at', { ascending: false });
+    const { data, error } = await supabase.from('nft_badges').select('*').eq('wallet_address', wallet).order('minted_at', { ascending: false });
     if (error) return safeError(res, 500, 'Failed to fetch badges');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── RWA ──────────────────────────────────────────────────
 v1.post('/rwa/purchase', authenticateToken, async (req, res) => {
   try {
     const { brandId, luxfiAmount, bnbPaid, txHash } = sanitize(req.body);
@@ -954,12 +1142,7 @@ v1.post('/rwa/purchase', authenticateToken, async (req, res) => {
     if (parseFloat(luxfiAmount) <= 0) return safeError(res, 400, 'Invalid LUXFI amount');
     if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) return safeError(res, 400, 'Invalid transaction hash');
     const verification = await verifyTransaction(txHash, req.user.walletAddress);
-    if (!verification.valid) {
-      await auditLog('INVALID_RWA_PURCHASE', req.user.walletAddress, { txHash, reason: verification.reason }, 'WARN');
-      return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
-    }
-    const suspicious = await transactionMonitor(req.user.walletAddress, 'RWA_PURCHASE');
-    if (suspicious) return safeError(res, 429, 'Suspicious activity detected');
+    if (!verification.valid) return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
     const { data, error } = await supabase.from('rwa_purchases').insert({
       wallet_address: req.user.walletAddress, brand_id: brandId,
       luxfi_amount: parseFloat(luxfiAmount), bnb_paid: parseFloat(bnbPaid),
@@ -975,13 +1158,13 @@ v1.get('/rwa/purchases/:wallet', authenticateToken, async (req, res) => {
   try {
     const wallet = sanitize(req.params.wallet);
     if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) return safeError(res, 400, 'Invalid wallet address');
-    const { data, error } = await supabase.from('rwa_purchases').select('*, brands(name, city)')
-      .eq('wallet_address', wallet).order('created_at', { ascending: false });
+    const { data, error } = await supabase.from('rwa_purchases').select('*, brands(name, city)').eq('wallet_address', wallet).order('created_at', { ascending: false });
     if (error) return safeError(res, 500, 'Failed to fetch purchases');
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── STAKING ──────────────────────────────────────────────
 v1.post('/staking/stake', authenticateToken, async (req, res) => {
   try {
     const { luxfiAmount, txHash } = sanitize(req.body);
@@ -989,10 +1172,7 @@ v1.post('/staking/stake', authenticateToken, async (req, res) => {
     if (parseFloat(luxfiAmount) <= 0) return safeError(res, 400, 'Invalid staking amount');
     if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) return safeError(res, 400, 'Invalid transaction hash');
     const verification = await verifyTransaction(txHash, req.user.walletAddress);
-    if (!verification.valid) {
-      await auditLog('INVALID_STAKE_TX', req.user.walletAddress, { txHash, reason: verification.reason }, 'WARN');
-      return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
-    }
+    if (!verification.valid) return safeError(res, 400, `Transaction verification failed: ${verification.reason}`);
     const { data, error } = await supabase.from('staking_positions').insert({
       wallet_address: req.user.walletAddress, luxfi_staked: parseFloat(luxfiAmount),
       stake_tx_hash: txHash, status: 'active'
@@ -1031,6 +1211,7 @@ v1.get('/staking/:wallet', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── MISSION REWARDS ──────────────────────────────────────
 v1.post('/missions/rewards/distribute', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
@@ -1040,7 +1221,6 @@ v1.post('/missions/rewards/distribute', async (req, res) => {
     const { data: claim, error } = await supabase.from('mission_claims').select('*').eq('id', claimId).single();
     if (error || !claim) return safeError(res, 404, 'Claim not found');
     if (claim.reward_status !== 'pending_distribution') return safeError(res, 400, 'Reward not pending distribution');
-    if (claim.status !== 'approved') return safeError(res, 400, 'Claim not approved');
     await supabase.from('nft_badges').insert({
       wallet_address: claim.agent_wallet,
       badge_tier: claim.nft_badge_tier || 1,
@@ -1050,14 +1230,8 @@ v1.post('/missions/rewards/distribute', async (req, res) => {
     await supabase.from('mission_claims').update({
       reward_status: 'distributed', distributed_at: new Date().toISOString()
     }).eq('id', claimId);
-    await auditLog('REWARD_DISTRIBUTED', claim.agent_wallet, {
-      claimId, luxfi: claim.luxfi_reward_amount, bnb: claim.bnb_reward_amount, badge: claim.nft_badge_tier
-    }, 'INFO');
-    res.json({
-      success: true, claimId, agentWallet: claim.agent_wallet,
-      luxfiRewarded: claim.luxfi_reward_amount, bnbRewarded: claim.bnb_reward_amount,
-      badgeTier: claim.nft_badge_tier, note: 'On-chain distribution pending contract deployment'
-    });
+    await auditLog('REWARD_DISTRIBUTED', claim.agent_wallet, { claimId }, 'INFO');
+    res.json({ success: true, claimId, note: 'On-chain distribution pending contract deployment' });
   } catch { safeError(res, 500, 'Server error'); }
 });
 
@@ -1121,7 +1295,6 @@ Return ONLY JSON: {"codename": "OPERATION NAME", "briefing": "3 sentences.", "re
     res.json(mission);
   } catch (err) {
     logger.error({ message: 'Mission generation failed', err: err.message });
-    Sentry.captureException(err);
     return safeError(res, 500, 'Mission generation failed');
   }
 });
@@ -1163,15 +1336,13 @@ v1.get('/admin/anomalies', async (req, res) => {
   try {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
-    const [highSeverity, recentLogins, suspiciousActivity] = await Promise.all([
+    const [highSeverity, recentLogins] = await Promise.all([
       supabase.from('audit_logs').select('*').eq('severity', 'HIGH').order('created_at', { ascending: false }).limit(20),
-      supabase.from('audit_logs').select('*').eq('action', 'FAILED_LOGIN').gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()),
-      supabase.from('suspicious_activity').select('*').eq('resolved', false).order('created_at', { ascending: false }).limit(20)
+      supabase.from('audit_logs').select('*').eq('action', 'FAILED_LOGIN').gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
     ]);
     res.json({
       highSeverityEvents: highSeverity.data || [],
       failedLoginsLast24h: recentLogins.data?.length || 0,
-      unresolvedSuspicious: suspiciousActivity.data || [],
       generatedAt: new Date().toISOString()
     });
   } catch { safeError(res, 500, 'Server error'); }
@@ -1184,19 +1355,23 @@ setInterval(async () => {
     logger.info({ message: 'Expired nonces cleaned up' });
   } catch (err) {
     logger.error({ message: 'Nonce cleanup failed', err: err.message });
-    Sentry.captureException(err);
   }
 }, 30 * 60 * 1000);
 
 setInterval(async () => {
   try {
-    await supabase.rpc('update_all_time_weighted_scores');
-    logger.info({ message: 'Time-weighted scores updated' });
+    const { data: expiredFlash } = await supabase.from('missions')
+      .select('id').eq('is_flash_mission', true).eq('status', 'active')
+      .lt('flash_expires_at', new Date().toISOString());
+    if (expiredFlash && expiredFlash.length > 0) {
+      await supabase.from('missions').update({ status: 'expired' })
+        .in('id', expiredFlash.map(m => m.id));
+      logger.info({ message: `Expired ${expiredFlash.length} flash missions` });
+    }
   } catch (err) {
-    logger.error({ message: 'Score update failed', err: err.message });
-    Sentry.captureException(err);
+    logger.error({ message: 'Flash mission cleanup failed', err: err.message });
   }
-}, 60 * 60 * 1000);
+}, 5 * 60 * 1000);
 
 app.use((req, res) => safeError(res, 404, 'Route not found'));
 
