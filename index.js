@@ -377,6 +377,7 @@ app.get('/metrics', async (req, res) => {
   res.end(await promClient.register.metrics());
 });
 
+// ─── MARKET DATA ─────────────────────────────────────────
 v1.get('/market/bnb-price', async (req, res) => {
   try { res.json(await getBNBPrice()); }
   catch { return safeError(res, 500, 'Failed to fetch BNB price'); }
@@ -392,6 +393,56 @@ v1.get('/market/brand/:brandId', authenticateToken, async (req, res) => {
   } catch { return safeError(res, 500, 'Failed to fetch brand market data'); }
 });
 
+// ─── BRAND INTELLIGENCE ───────────────────────────────────
+v1.get('/intelligence/brands', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('brand_intelligence')
+      .select('*')
+      .order('health_score', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch brand intelligence');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/intelligence/brands/luxfi', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('brand_intelligence')
+      .select('*')
+      .eq('is_luxfi_brand', true)
+      .order('health_score', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch LUXFI brands');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/intelligence/brands/competitors', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('brand_intelligence')
+      .select('*')
+      .eq('is_luxfi_brand', false)
+      .order('health_score', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch competitors');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/intelligence/market', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('market_intelligence')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .single();
+    if (error) return safeError(res, 500, 'Failed to fetch market intelligence');
+    res.json(data);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── AUTH ─────────────────────────────────────────────────
 v1.post('/auth/nonce', authLimiter, async (req, res) => {
   const { walletAddress } = sanitize(req.body);
   if (!walletAddress) return safeError(res, 400, 'walletAddress required');
@@ -433,6 +484,7 @@ v1.post('/auth/login', authLimiter, checkJurisdiction, async (req, res) => {
   } catch { return safeError(res, 500, 'Authentication failed'); }
 });
 
+// ─── BRANDS ───────────────────────────────────────────────
 v1.get('/brands', async (req, res) => {
   try {
     const { data, error } = await supabase.from('brands').select('*').order('created_at', { ascending: false });
@@ -484,6 +536,7 @@ v1.put('/brands/:id', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── USERS ────────────────────────────────────────────────
 v1.get('/users/:wallet', authenticateToken, async (req, res) => {
   try {
     const wallet = sanitize(req.params.wallet);
@@ -509,6 +562,7 @@ v1.put('/users/:id/kyc', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── TRANSACTIONS ─────────────────────────────────────────
 v1.get('/transactions', authenticateToken, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 0;
@@ -551,6 +605,7 @@ v1.post('/transactions', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── REWARDS ──────────────────────────────────────────────
 v1.get('/rewards/pools', async (req, res) => {
   try {
     const { data, error } = await supabase.from('reward_pools').select('*, brands(name)').eq('status', 'active');
@@ -583,6 +638,7 @@ v1.post('/rewards/claim', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── GOVERNANCE ───────────────────────────────────────────
 v1.get('/governance', async (req, res) => {
   try {
     const { data, error } = await supabase.from('governance_proposals').select('*, brands(name)').order('created_at', { ascending: false });
@@ -624,6 +680,7 @@ v1.post('/governance/vote', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── MARKETPLACE ──────────────────────────────────────────
 v1.get('/marketplace', async (req, res) => {
   try {
     const { data, error } = await supabase.from('marketplace_listings').select('*, brands(name)').eq('status', 'active');
@@ -679,6 +736,7 @@ v1.put('/marketplace/:id/cancel', authenticateToken, async (req, res) => {
   } catch { safeError(res, 500, 'Server error'); }
 });
 
+// ─── MISSIONS ─────────────────────────────────────────────
 v1.get('/missions', async (req, res) => {
   try {
     const { city, mission_type, difficulty } = sanitize(req.query);
@@ -783,26 +841,13 @@ v1.post('/missions/claims/:claimId/ai-verify', authenticateToken, missionVerifyL
     if (!claim.intel_text) return safeError(res, 400, 'No intel submitted');
     await supabase.from('mission_claims').update({ status: 'ai_reviewing' }).eq('id', claimId);
     const mission = claim.missions;
-    const prompt = `You are ARIA, the AI verification system for LUXFI — a Web 4.0 RWA tokenization platform in Southeast Asia.
-Your job is to verify mission intel submitted by field agents.
-MISSION DETAILS:
-- Codename: ${sanitizePromptInput(mission?.codename || 'Unknown')}
-- Brand: ${sanitizePromptInput(mission?.brand_name || 'Unknown')}
-- City: ${sanitizePromptInput(mission?.city || 'Unknown')}
-- Mission Type: ${sanitizePromptInput(mission?.mission_type || 'Unknown')}
-- Difficulty: ${mission?.difficulty || 1}
-AGENT INTEL SUBMITTED:
-${sanitizePromptInput(claim.intel_text.substring(0, 3000))}
-GPS VERIFIED: ${claim.gps_verified ? 'YES' : 'NO'}
-PHOTOS SUBMITTED: ${claim.intel_photos ? claim.intel_photos.length : 0}
-Evaluate this intel and respond ONLY with JSON:
-{
-  "score": 85,
-  "approved": true,
-  "reason": "Clear and detailed intel with GPS verification",
-  "feedback": "Excellent field work.",
-  "flags": []
-}
+    const prompt = `You are ARIA, the AI verification system for LUXFI.
+MISSION: ${sanitizePromptInput(mission?.codename || 'Unknown')}
+BRAND: ${sanitizePromptInput(mission?.brand_name || 'Unknown')}
+CITY: ${sanitizePromptInput(mission?.city || 'Unknown')}
+INTEL: ${sanitizePromptInput(claim.intel_text.substring(0, 3000))}
+GPS: ${claim.gps_verified ? 'YES' : 'NO'}
+Respond ONLY with JSON: {"score": 85, "approved": true, "reason": "...", "feedback": "...", "flags": []}
 Score 0-100. Approve if score >= 70.`;
     const aiResponse = await callClaudeWithFallback(prompt, 500);
     let verification;
@@ -1037,17 +1082,12 @@ v1.post('/ai/generate-mission', async (req, res) => {
     if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
     const { brand, missionType, city, difficulty } = sanitize(req.body);
     if (!brand || !missionType || !city) return safeError(res, 400, 'brand, missionType and city required');
-    const prompt = `You are the AI agent behind LUXFI, a blockchain platform tokenizing real-world lifestyle brands in Southeast Asia. Generate a dramatic spy-style mission briefing.
+    const prompt = `You are the AI agent behind LUXFI. Generate a spy-style mission briefing.
 Brand: ${sanitizePromptInput(brand)}
 Mission Type: ${sanitizePromptInput(missionType)}
 City: ${sanitizePromptInput(city)}
 Difficulty: ${sanitizePromptInput(difficulty || 'ROUTINE')}
-Return ONLY a JSON object with no markdown, no backticks:
-{
-  "codename": "OPERATION [DRAMATIC TWO WORD NAME IN CAPS]",
-  "briefing": "3 sentences in spy AI voice.",
-  "requirements": ["Requirement 1", "Requirement 2", "Requirement 3", "Requirement 4"]
-}`;
+Return ONLY JSON: {"codename": "OPERATION NAME", "briefing": "3 sentences.", "requirements": ["req1", "req2", "req3", "req4"]}`;
     const result = await callClaudeWithFallback(prompt);
     const mission = JSON.parse(result);
     await auditLog('GENERATE_MISSION', 'admin', { brand, city }, 'INFO');
@@ -1139,3 +1179,5 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
+
+
