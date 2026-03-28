@@ -1208,10 +1208,4 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
-```
 
----
-
-Commit message:
-```
-feat: add notification endpoints for mission approvals and rewards
