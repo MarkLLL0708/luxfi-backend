@@ -408,8 +408,8 @@ const v1 = express.Router();
 app.use('/api/v1', v1);
 app.use('/api', v1);
 
-app.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
-v1.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v1', time: new Date() }));
+app.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v2-hybrid', time: new Date() }));
+v1.get('/health', (req, res) => res.json({ status: 'LUXFI Backend Online', version: 'v2-hybrid', time: new Date() }));
 
 app.get('/metrics', async (req, res) => {
   const adminKey = req.headers['x-admin-key'];
@@ -488,7 +488,7 @@ YOUR PERSONALITY:
 - You care about the brands like they are your children — you want them to succeed
 
 HOW USERS MAKE MONEY ON LUXFI:
-1. STAKING — stake LUXFI tokens on real brands like Clay & Cloud or Little Nonya and earn weekly payouts automatically
+1. RBO — Buy fractional shares in real brands like Clay & Cloud or Little Nonya and earn monthly yield from verified POS revenue
 2. MISSIONS — go to real physical locations, complete field intel tasks, earn LUXFI + BNB + NFT badges
 3. DOUBLE AGENT — complete a LUXFI brand mission AND a competitor mission same day for bonus rewards
 4. GHOST SIGNAL — walk near a competitor brand location and a secret proximity mission auto-triggers on your phone
@@ -497,9 +497,10 @@ HOW USERS MAKE MONEY ON LUXFI:
 
 RWA CONTEXT:
 - Clay & Cloud is a premium fermented beverage brand in Hanoi — real physical cafe with real revenue
-- Little Nonya is a Peranakan dessert brand across Hanoi, Shanghai, Suzhou, Shenzhen — real multi-city revenue
-- When you stake LUXFI on these brands you own a piece of their real-world revenue
-- The weekly payout comes from actual cafe revenue — not made up numbers
+- Little Nonya is a Peranakan dessert brand across Shanghai, Suzhou, Hangzhou — real multi-city revenue
+- When you buy RBO shares you own a piece of their real-world revenue
+- The yield comes from actual POS revenue — verified daily via FLIPOS — not made up numbers
+- Revenue split: 50% to investors, 20% platform, 20% agent rewards, 10% stability reserve
 
 CURRENT BRAND INTEL:
 ${brandContext}
@@ -1439,22 +1440,23 @@ v1.get('/rwa/purchases/:wallet', authenticateToken, async (req, res) => {
     res.json(data);
   } catch { safeError(res, 500, 'Server error'); }
 });
-// ─── RBO — REAL BRAND OWNERSHIP ──────────────────────────────────
 
-// Purchase RBO shares
+// ─── RBO — REAL BRAND OWNERSHIP (HYBRID v2) ──────────────────────
+
+// Purchase RBO shares (with 1% trading fee)
 v1.post('/rbo/purchase', authenticateToken, async (req, res) => {
   try {
     const { brandId, numberOfShares, walletAddress } = sanitize(req.body);
     if (!brandId || !numberOfShares || !walletAddress) return safeError(res, 400, 'brandId, numberOfShares and walletAddress required');
     if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) return safeError(res, 400, 'Invalid wallet');
 
-    // Get brand from DB
     const { data: brand, error: brandErr } = await supabase.from('rbo_brands').select('*').eq('brand_id', brandId).single();
     if (brandErr || !brand) return safeError(res, 404, 'Brand not found');
 
-    const totalCostUSD = brand.share_price_usd * numberOfShares;
+    const grossCostUSD = brand.share_price_usd * numberOfShares;
+    const tradingFeeUSD = grossCostUSD * 0.01;
+    const totalCostUSD = grossCostUSD + tradingFeeUSD;
 
-    // Record purchase
     const { data, error } = await supabase.from('rbo_positions').upsert({
       wallet_address: walletAddress,
       brand_id: brandId,
@@ -1468,24 +1470,24 @@ v1.post('/rbo/purchase', authenticateToken, async (req, res) => {
 
     if (error) return safeError(res, 500, 'Failed to record purchase');
 
-    await auditLog('RBO_PURCHASE', walletAddress, { brandId, shares: numberOfShares, costUSD: totalCostUSD }, 'INFO');
-    res.json({ success: true, position: data, totalCostUSD, sharePrice: brand.share_price_usd });
+    await auditLog('RBO_PURCHASE', walletAddress, { brandId, shares: numberOfShares, costUSD: totalCostUSD, tradingFee: tradingFeeUSD }, 'INFO');
+    res.json({ success: true, position: data, totalCostUSD, tradingFeeUSD, sharePrice: brand.share_price_usd });
   } catch { safeError(res, 500, 'Server error'); }
 });
 
-// Request exit (tiered)
+// Request exit (time-priority system — 3%/1%/0%)
 v1.post('/rbo/exit', authenticateToken, async (req, res) => {
   try {
     const { brandId, shares, tier, walletAddress } = sanitize(req.body);
     if (!brandId || !shares || !tier || !walletAddress) return safeError(res, 400, 'brandId, shares, tier and walletAddress required');
-    if (![1,2,3].includes(parseInt(tier))) return safeError(res, 400, 'Tier must be 1 (instant), 2 (7-day), or 3 (30-day)');
+    if (![1,2,3].includes(parseInt(tier))) return safeError(res, 400, 'Tier must be 1 (priority), 2 (standard), or 3 (patient)');
 
     const { data: brand } = await supabase.from('rbo_brands').select('*').eq('brand_id', brandId).single();
     const { data: pos }   = await supabase.from('rbo_positions').select('*').eq('wallet_address', walletAddress).eq('brand_id', brandId).single();
     if (!pos || pos.shares_held < shares) return safeError(res, 400, 'Insufficient shares');
 
     const grossUSD = shares * brand.share_price_usd;
-    const feeRates = {1: 0.05, 2: 0.01, 3: 0};
+    const feeRates = {1: 0.03, 2: 0.01, 3: 0};
     const feeUSD   = grossUSD * feeRates[tier];
     const netUSD   = grossUSD - feeUSD;
 
@@ -1513,7 +1515,6 @@ v1.post('/rbo/exit', authenticateToken, async (req, res) => {
 
     if (error) return safeError(res, 500, 'Failed to record exit request');
 
-    // Deduct shares from position
     await supabase.from('rbo_positions').update({
       shares_held: pos.shares_held - shares,
       compounding: false
@@ -1522,9 +1523,9 @@ v1.post('/rbo/exit', authenticateToken, async (req, res) => {
     await auditLog('RBO_EXIT', walletAddress, { brandId, tier, shares, netUSD }, 'INFO');
 
     const messages = {
-      1: `Instant exit: receiving $${netUSD.toFixed(2)} (5% fee applied)`,
-      2: `7-day exit: receiving $${netUSD.toFixed(2)} in 7 days (1% fee applied)`,
-      3: `30-day exit: receiving $${(netUSD * 1.005).toFixed(2)} in 30 days (0% fee + 0.5% bonus)`
+      1: `Priority exit: receiving $${netUSD.toFixed(2)} (3% priority fee applied)`,
+      2: `Standard exit: receiving $${netUSD.toFixed(2)} in 7 days (1% fee applied)`,
+      3: `Patient exit: receiving $${(netUSD * 1.005).toFixed(2)} in 30 days (0% fee + 0.5% loyalty bonus)`
     };
     res.json({ success: true, exit: data, message: messages[tier] });
   } catch { safeError(res, 500, 'Server error'); }
@@ -1631,6 +1632,183 @@ v1.get('/rbo/secondary/:brandId', async (req, res) => {
     res.json(data || []);
   } catch { safeError(res, 500, 'Server error'); }
 });
+
+// ─── RBO STATS ────────────────────────────────────────────
+v1.get('/rbo/brand/all', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('rbo_brands').select('*').eq('active', true).order('created_at', { ascending: false });
+    if (error) return safeError(res, 500, 'Failed to fetch brands');
+    res.json(data || []);
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/rbo/stats', async (req, res) => {
+  try {
+    const [brands, positions, exits] = await Promise.all([
+      supabase.from('rbo_brands').select('*').eq('active', true),
+      supabase.from('rbo_positions').select('brand_id, shares_held, total_invested_usd').gt('shares_held', 0),
+      supabase.from('rbo_exits').select('net_usd, fee_usd, status')
+    ]);
+    const totalTVL = (positions.data || []).reduce((sum, p) => sum + parseFloat(p.total_invested_usd || 0), 0);
+    const totalHolders = new Set((positions.data || []).map(p => p.brand_id)).size;
+    const totalFeesCollected = (exits.data || []).reduce((sum, e) => sum + parseFloat(e.fee_usd || 0), 0);
+    res.json({ totalBrands: (brands.data || []).length, totalTVL: totalTVL.toFixed(2), totalHolders, totalFeesCollected: totalFeesCollected.toFixed(2), timestamp: new Date().toISOString() });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── POS REVENUE INGESTION ────────────────────────────────
+v1.post('/rbo/pos/ingest', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const { brandId, date, grossSales, netSales, currency } = sanitize(req.body);
+    if (!brandId || !date || grossSales === undefined) return safeError(res, 400, 'brandId, date and grossSales required');
+    const gross = parseFloat(grossSales);
+    const net = parseFloat(netSales || grossSales);
+    if (isNaN(gross) || gross < 0) return safeError(res, 400, 'Invalid grossSales');
+    const VND_TO_USD = 0.000040;
+    const usdEquivalent = (currency === 'VND') ? gross * VND_TO_USD : gross;
+    const { data, error } = await supabase.from('rbo_pos_revenue').upsert({
+      brand_id: brandId, date, gross_sales: gross, net_sales: net,
+      currency: currency || 'VND', usd_equivalent: usdEquivalent,
+      source: 'flipos', verified: false
+    }, { onConflict: 'brand_id,date' }).select().single();
+    if (error) return safeError(res, 500, 'Failed to ingest POS data');
+    await auditLog('POS_INGEST', 'system', { brandId, date, grossSales: gross }, 'INFO');
+    res.json({ success: true, record: data });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.post('/rbo/pos/ingest-batch', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const { records } = req.body;
+    if (!Array.isArray(records) || records.length === 0) return safeError(res, 400, 'records array required');
+    if (records.length > 100) return safeError(res, 400, 'Maximum 100 records per batch');
+    const VND_TO_USD = 0.000040;
+    const prepared = records.map(r => ({
+      brand_id: r.brandId, date: r.date,
+      gross_sales: parseFloat(r.grossSales), net_sales: parseFloat(r.netSales || r.grossSales),
+      currency: r.currency || 'VND',
+      usd_equivalent: (r.currency === 'VND') ? parseFloat(r.grossSales) * VND_TO_USD : parseFloat(r.grossSales),
+      source: 'flipos', verified: false
+    }));
+    const { data, error } = await supabase.from('rbo_pos_revenue').upsert(prepared, { onConflict: 'brand_id,date' }).select();
+    if (error) return safeError(res, 500, 'Failed to ingest batch');
+    await auditLog('POS_BATCH_INGEST', 'system', { count: records.length }, 'INFO');
+    res.json({ success: true, ingested: (data || []).length });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.get('/rbo/pos/:brandId', async (req, res) => {
+  try {
+    const brandId = sanitize(req.params.brandId);
+    const days = parseInt(req.query.days) || 30;
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const { data, error } = await supabase.from('rbo_pos_revenue').select('date, gross_sales, net_sales, usd_equivalent, currency, verified')
+      .eq('brand_id', brandId).gte('date', since).order('date', { ascending: true });
+    if (error) return safeError(res, 500, 'Failed to fetch POS data');
+    const totalUSD = (data || []).reduce((sum, d) => sum + parseFloat(d.usd_equivalent || 0), 0);
+    res.json({ brandId, period: `${days} days`, totalRevenueUSD: totalUSD.toFixed(2), dailyRevenue: data || [] });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── AAB ADMIN ENDPOINTS ──────────────────────────────────
+v1.get('/rbo/aab/:brandId', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const brandId = sanitize(req.params.brandId);
+    const { data: brand } = await supabase.from('rbo_brands').select('brand_id, aab_rate, aab_mode, aab_mode_entered_at, aab_banked_reserve, stability_reserve_balance, settlement_reserve_balance, agent_reward_multiplier, exit_queue_pressure').eq('brand_id', brandId).single();
+    if (!brand) return safeError(res, 404, 'Brand not found');
+    const { data: history } = await supabase.from('rbo_aab_transitions').select('*').eq('brand_id', brandId).order('created_at', { ascending: false }).limit(10);
+    res.json({ brand, transitionHistory: history || [] });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+v1.post('/rbo/aab/adjust', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const { brandId, newRate, reason } = sanitize(req.body);
+    if (!brandId || newRate === undefined) return safeError(res, 400, 'brandId and newRate required');
+    const rate = parseFloat(newRate);
+    if (isNaN(rate) || rate < 3.0 || rate > 8.0) return safeError(res, 400, 'AAB rate must be between 3.0 and 8.0');
+    const { data: brand } = await supabase.from('rbo_brands').select('aab_rate, aab_banked_reserve').eq('brand_id', brandId).single();
+    if (!brand) return safeError(res, 404, 'Brand not found');
+    const oldRate = brand.aab_rate || 5.0;
+    if (Math.abs(rate - oldRate) > 1.0) return safeError(res, 400, 'Maximum adjustment is 1 percentage point per change');
+    await supabase.from('rbo_brands').update({ aab_rate: rate }).eq('brand_id', brandId);
+    await supabase.from('rbo_aab_transitions').insert({
+      brand_id: brandId, previous_mode: 'manual_adjust', new_mode: 'manual_adjust',
+      trigger_reason: reason || 'Manual AAB rate adjustment',
+      metrics_snapshot: { old_rate: oldRate, new_rate: rate },
+      reserve_balance_before: brand.aab_banked_reserve, reserve_balance_after: brand.aab_banked_reserve,
+      approved_by: 'admin'
+    });
+    await auditLog('AAB_ADJUST', 'admin', { brandId, oldRate, newRate: rate, reason }, 'INFO');
+    res.json({ success: true, brandId, previousRate: oldRate, newRate: rate });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── EXIT QUEUE MONITORING ────────────────────────────────
+v1.get('/rbo/exit-queue/:brandId', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const brandId = sanitize(req.params.brandId);
+    const { data: pendingExits } = await supabase.from('rbo_exits').select('*').eq('brand_id', brandId).eq('status', 'pending').order('requested_at', { ascending: true });
+    const { data: brand } = await supabase.from('rbo_brands').select('share_price_usd, total_shares').eq('brand_id', brandId).single();
+    const { data: positions } = await supabase.from('rbo_positions').select('shares_held').eq('brand_id', brandId).gt('shares_held', 0);
+    const totalSharesHeld = (positions || []).reduce((sum, p) => sum + p.shares_held, 0);
+    const brandTVL = totalSharesHeld * (brand?.share_price_usd || 0);
+    const pendingExitValue = (pendingExits || []).reduce((sum, e) => sum + parseFloat(e.gross_usd || 0), 0);
+    const queuePressure = brandTVL > 0 ? (pendingExitValue / brandTVL) : 0;
+    res.json({ brandId, pendingExits: (pendingExits || []).length, pendingExitValueUSD: pendingExitValue.toFixed(2), brandTVL: brandTVL.toFixed(2), queuePressure: (queuePressure * 100).toFixed(1) + '%', queuePressureRaw: queuePressure, exits: pendingExits || [] });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
+// ─── OPERATOR DASHBOARD ───────────────────────────────────
+v1.get('/admin/rbo/dashboard', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return safeError(res, 401, 'Unauthorized');
+    const [brands, positions, exits, posRevenue] = await Promise.all([
+      supabase.from('rbo_brands').select('*').eq('active', true),
+      supabase.from('rbo_positions').select('brand_id, shares_held, total_invested_usd, wallet_address').gt('shares_held', 0),
+      supabase.from('rbo_exits').select('brand_id, gross_usd, fee_usd, status, tier, requested_at').order('requested_at', { ascending: false }).limit(50),
+      supabase.from('rbo_pos_revenue').select('brand_id, date, usd_equivalent').gte('date', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0])
+    ]);
+    const brandMetrics = (brands.data || []).map(brand => {
+      const brandPositions = (positions.data || []).filter(p => p.brand_id === brand.brand_id);
+      const brandExits = (exits.data || []).filter(e => e.brand_id === brand.brand_id && e.status === 'pending');
+      const brandRevenue = (posRevenue.data || []).filter(r => r.brand_id === brand.brand_id);
+      const tvl = brandPositions.reduce((sum, p) => sum + (p.shares_held * brand.share_price_usd), 0);
+      const holders = new Set(brandPositions.map(p => p.wallet_address)).size;
+      const pendingExitValue = brandExits.reduce((sum, e) => sum + parseFloat(e.gross_usd || 0), 0);
+      const monthlyRevenue = brandRevenue.reduce((sum, r) => sum + parseFloat(r.usd_equivalent || 0), 0);
+      return {
+        brandId: brand.brand_id, brandName: brand.brand_name,
+        aabMode: brand.aab_mode || 'growth', aabRate: brand.aab_rate || 5.0,
+        sharePrice: brand.share_price_usd, tvl: tvl.toFixed(2), holders,
+        pendingExits: brandExits.length, pendingExitValueUSD: pendingExitValue.toFixed(2),
+        exitQueuePressure: tvl > 0 ? ((pendingExitValue / tvl) * 100).toFixed(1) + '%' : '0%',
+        monthlyRevenueUSD: monthlyRevenue.toFixed(2),
+        reserveBalance: brand.stability_reserve_balance || 0,
+        ariaScore: brand.aria_score || 0
+      };
+    });
+    const totalTVL = brandMetrics.reduce((sum, b) => sum + parseFloat(b.tvl), 0);
+    const totalRevenue = brandMetrics.reduce((sum, b) => sum + parseFloat(b.monthlyRevenueUSD), 0);
+    const brandsInStress = brandMetrics.filter(b => ['defend', 'emergency', 'early_defend'].includes(b.aabMode)).length;
+    res.json({
+      summary: { totalTVL: totalTVL.toFixed(2), totalMonthlyRevenue: totalRevenue.toFixed(2), totalBrands: brandMetrics.length, brandsInStress, timestamp: new Date().toISOString() },
+      brands: brandMetrics, recentExits: (exits.data || []).slice(0, 20)
+    });
+  } catch { safeError(res, 500, 'Server error'); }
+});
+
 // ─── STAKING ──────────────────────────────────────────────
 v1.post('/staking/stake', authenticateToken, async (req, res) => {
   try {
@@ -1848,4 +2026,4 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => logger.info({ message: `LUXFI Backend v1 running on port ${PORT}` }));
+app.listen(PORT, () => logger.info({ message: `LUXFI Backend v2-hybrid running on port ${PORT}` }));
